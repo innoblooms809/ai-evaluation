@@ -1,0 +1,30 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Model cache and training outputs
+model_cache/
+outputs/
+results.json
+*.egg-info/
+build/
+dist/
+*.log
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+.env.local
+
+# IDE/System files
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

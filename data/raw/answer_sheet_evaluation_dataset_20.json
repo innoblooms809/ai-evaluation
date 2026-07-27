@@ -1,0 +1,1082 @@
+[
+  {
+    "subject": "Computer Science",
+    "question": "What is Artificial Intelligence?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "Artificial Intelligence is the simulation of human intelligence by machines. It enables learning, reasoning and decision making.",
+    "student_answer": "Artificial Intelligence is the simulation of human intelligence by machines",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "Computer Science",
+    "question": "Define Machine Learning.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "Machine Learning enables systems to learn patterns from data without explicit programming.",
+    "student_answer": "Machine Learning enables systems to learn patterns from data without explicit programming It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "Computer Science",
+    "question": "What is an Operating System?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "An Operating System manages hardware resources and provides services for applications.",
+    "student_answer": "An Operating System manages hardware resources and provides services for applications",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "Computer Science",
+    "question": "Explain DBMS.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A DBMS is software used to create, store and manage databases.",
+    "student_answer": "A DBMS is software used to create, store and manage databases It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "Computer Science",
+    "question": "What is a Computer Network?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A computer network connects devices to share data and resources.",
+    "student_answer": "A computer network connects devices to share data and resources",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "Physics",
+    "question": "State Newton's First Law.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "An object remains at rest or in uniform motion unless acted upon by an external force.",
+    "student_answer": "An object remains at rest or in uniform motion unless acted upon by an external force It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "Physics",
+    "question": "Define velocity.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "Velocity is the rate of change of displacement with direction.",
+    "student_answer": "Velocity is the rate of change of displacement with direction",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "Physics",
+    "question": "What is Ohm's Law?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "Voltage equals current multiplied by resistance.",
+    "student_answer": "Voltage equals current multiplied by resistance It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "Physics",
+    "question": "Define kinetic energy.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "Kinetic energy is the energy possessed by a moving object.",
+    "student_answer": "Kinetic energy is the energy possessed by a moving object",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "Physics",
+    "question": "What is gravity?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "Gravity is the force of attraction between masses.",
+    "student_answer": "Gravity is the force of attraction between masses It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "Mathematics",
+    "question": "What is a prime number?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A prime number has exactly two distinct positive divisors.",
+    "student_answer": "A prime number has exactly two distinct positive divisors",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "Mathematics",
+    "question": "Define derivative.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A derivative measures the rate of change of a function.",
+    "student_answer": "A derivative measures the rate of change of a function It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "Mathematics",
+    "question": "What is a matrix?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A matrix is a rectangular arrangement of numbers.",
+    "student_answer": "A matrix is a rectangular arrangement of numbers",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "Mathematics",
+    "question": "Define probability.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "Probability measures the likelihood of an event.",
+    "student_answer": "Probability measures the likelihood of an event It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "Mathematics",
+    "question": "What is a triangle?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A triangle is a polygon with three sides.",
+    "student_answer": "A triangle is a polygon with three sides",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "English",
+    "question": "What is a noun?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A noun is a word that names a person, place, thing or idea.",
+    "student_answer": "A noun is a word that names a person, place, thing or idea It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "English",
+    "question": "Define adjective.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "An adjective describes or modifies a noun.",
+    "student_answer": "An adjective describes or modifies a noun",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "English",
+    "question": "What is a paragraph?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A paragraph is a group of related sentences on one idea.",
+    "student_answer": "A paragraph is a group of related sentences on one idea It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  },
+  {
+    "subject": "English",
+    "question": "What is active voice?",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "In active voice, the subject performs the action.",
+    "student_answer": "In active voice, the subject performs the action",
+    "evaluation": {
+      "marks_awarded": 4,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 1,
+          "reason": "Some supporting details are missing."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Good answer with minor missing details.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Add more supporting details"
+      ]
+    }
+  },
+  {
+    "subject": "English",
+    "question": "Define synonym.",
+    "maximum_marks": 5,
+    "rubric": {
+      "criteria": [
+        {
+          "name": "Core concept",
+          "marks": 2,
+          "description": "States the correct definition or principle."
+        },
+        {
+          "name": "Key points",
+          "marks": 2,
+          "description": "Includes important supporting details."
+        },
+        {
+          "name": "Clarity",
+          "marks": 1,
+          "description": "Clear and concise explanation."
+        }
+      ]
+    },
+    "reference_answer": "A synonym is a word with the same or similar meaning.",
+    "student_answer": "A synonym is a word with the same or similar meaning It is widely used.",
+    "evaluation": {
+      "marks_awarded": 5,
+      "criterion_scores": [
+        {
+          "criterion": "Core concept",
+          "score": 2,
+          "reason": "Main idea is correct."
+        },
+        {
+          "criterion": "Key points",
+          "score": 2,
+          "reason": "Supporting details included."
+        },
+        {
+          "criterion": "Clarity",
+          "score": 1,
+          "reason": "Answer is easy to understand."
+        }
+      ],
+      "overall_feedback": "Excellent answer covering all important points.",
+      "strengths": [
+        "Correct concept",
+        "Clear explanation"
+      ],
+      "improvements": [
+        "Maintain this quality"
+      ]
+    }
+  }
+]

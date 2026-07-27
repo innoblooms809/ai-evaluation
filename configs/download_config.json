@@ -1,0 +1,8 @@
+{
+  "max_retries": 5,
+  "retry_backoff_factor": 2.0,
+  "chunk_size_bytes": 10485760,
+  "timeout_seconds": 120,
+  "max_workers": 1,
+  "verify_sha256": true
+}
