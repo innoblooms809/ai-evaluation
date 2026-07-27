@@ -11,6 +11,9 @@ results.json
 build/
 dist/
 *.log
+logs/
+extracted_files/
+node_modules/
 
 # Python caches
 __pycache__/
@@ -21,10 +24,15 @@ __pycache__/
 .env
 .env.local
 
+# Temporary files
+*.tmp
+*.swp
+*.bak
+
 # IDE/System files
 .vs/
 .vscode/
 .idea/
+*.iml
 .DS_Store
 Thumbs.db
-

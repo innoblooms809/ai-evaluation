@@ -1,3 +1,4 @@
+# PyTorch, HuggingFace & Fine-Tuning Core
 torch>=2.1.0
 transformers>=4.46.0
 peft>=0.13.0
@@ -7,3 +8,30 @@ datasets>=3.0.0
 accelerate>=1.0.0
 pydantic>=2.0.0
 huggingface-hub>=0.25.0
+
+# LangChain Framework & Vector Stores
+langchain>=0.3.0,<0.4.0
+langchain-community>=0.3.0,<0.4.0
+langchain-core>=0.3.0,<0.4.0
+langchain-openai>=0.2.0,<0.3.0
+langchain-qdrant>=0.2.0,<0.3.0
+
+# Web Framework
+fastapi>=0.95.0
+uvicorn>=0.22.0
+python-multipart>=0.0.6
+
+# Scientific Computing & Processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Document Processing
+pypdf>=3.0.0
+python-docx>=0.8.11
+pdfplumber>=0.10.0
+openpyxl>=3.1.0
+
+# Environment & Utilities
+python-dotenv>=1.0.0
+loguru>=0.7.0
+requests>=2.31.0
