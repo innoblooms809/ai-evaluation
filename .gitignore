@@ -29,6 +29,10 @@ __pycache__/
 *.swp
 *.bak
 
+# Binaries & Executables
+cloudflared.exe
+cloudflared_latest.exe
+
 # IDE/System files
 .vs/
 .vscode/
@@ -36,3 +40,4 @@ __pycache__/
 *.iml
 .DS_Store
 Thumbs.db
+
