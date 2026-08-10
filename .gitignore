@@ -1,7 +1,6 @@
 # Virtual environment
 venv/
 .venv/
-env/
 
 # Model cache and training outputs
 model_cache/
