@@ -172,7 +172,10 @@ logger = logging.getLogger("ocr_eval_pipeline5")
 OCR_SERVER_URL = os.getenv("OCR_SERVER_URL", "http://localhost:8000/ocrOutput")
 MAX_LLM_RETRIES = 2
 DEFAULT_MAX_MARKS = 5
-MAX_PARALLEL_WORKERS = min(max(CPU_COUNT // 4, 8), 16)
+# ── High-Performance GPU Tuning (80GB VRAM Testing & Production Config) ──
+# // TESTING & PRODUCTION CONFIGURATION:
+# // Set MAX_PARALLEL_WORKERS = 8 for 80GB VRAM GPUs (A100/H100/RTX 6000) to evaluate up to 8 questions in parallel!
+MAX_PARALLEL_WORKERS = int(os.getenv("MAX_PARALLEL_WORKERS", "8"))
 MAX_QUESTIONS_SUPPORTED = 100
 MULTI_PAGE_MAX = 30
 HIGH_CONFIDENCE_THRESHOLD = 0.65
