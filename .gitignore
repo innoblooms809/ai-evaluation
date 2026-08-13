@@ -28,6 +28,10 @@ __pycache__/
 cloudflared.exe
 cloudflared_latest.exe
 
+# Environment variables
+.env
+.env.*
+
 # IDE/System files
 .vs/
 .vscode/
