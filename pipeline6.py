@@ -37,6 +37,7 @@ import os
 import re
 import io
 import json
+import base64
 import math
 import time
 import logging
@@ -107,8 +108,10 @@ WEIGHT_KEYWORD = 0.12
 WEIGHT_LANGUAGE = 0.08
 WEIGHT_CONTEXT = 0.06
 
-# ── Thread Lock for VL Model ──
+# ── Thread Lock & In-Memory Visual Pre-Evaluation Cache ──
 _vl_model_lock = threading.Lock()
+_cache_lock = threading.Lock()
+_visual_eval_cache: Dict[str, Dict[str, Any]] = {}
 
 # ── Singleton HTTP Client for OCR ──
 _ocr_client: Optional[httpx.AsyncClient] = None
@@ -378,6 +381,7 @@ class OCRBlock:
     page_number: int = -1
     line_count: int = 0
     word_count: int = 0
+    is_explicit_header: bool = False
 
 
 @dataclass
@@ -516,6 +520,18 @@ class TextEvaluationRequest(BaseModel):
     answer_key_text: str
     student_answer_text: str
     max_marks: int = DEFAULT_MAX_MARKS
+    student_pdf_base64: Optional[str] = None
+    student_pdf_url: Optional[str] = None
+
+
+class VisualPreEvalRequest(BaseModel):
+    exam_id: str
+    student_id: str
+    question_paper_text: str
+    answer_key_text: str
+    student_pdf_base64: Optional[str] = None
+    student_pdf_url: Optional[str] = None
+    max_marks: int = DEFAULT_MAX_MARKS
 
 
 class ExamPreprocessRequest(BaseModel):
@@ -571,22 +587,38 @@ OCR_REPAIR_MAP = {
 }
 
 
+# Indic (Bengali & Devanagari) digit mapping to standard ASCII digits
+INDIC_DIGIT_MAP = str.maketrans("০১২৩৪৫৬৭৮৯०१२३४५६७८९", "01234567890123456789")
+
+
 def normalize_ocr_text(text: str) -> str:
-    """Normalize OCR text: fix encoding, split inline headers, repair common errors."""
+    """Normalize OCR text: fix encoding, convert Indic/Bengali digits, split inline headers."""
     if not text:
         return ""
     text = unicodedata.normalize("NFKC", text)
-    # Split inline question/answer headers onto separate lines
+    # Convert Bengali (১,২,৩) and Devanagari (१,२,३) numerals to standard ASCII digits (1,2,3)
+    text = text.translate(INDIC_DIGIT_MAP)
+
+    # Fix OCR split headers like Q.\n3. or Q . 3 . or Q..3
+    text = re.sub(r"([ \t\.\-\_]*Q)\s*[\.\:\-]+\s*\n\s*(\d+)", r"\1.\2. ", text, flags=re.IGNORECASE)
+    text = re.sub(r"([ \t\.\-\_]*Q)\s*[\.\:\-]+\s*(\d+)", r"Q.\2.", text, flags=re.IGNORECASE)
+
+    # Split inline question/answer headers onto separate lines (only after sentence punctuation or block end)
     text = re.sub(
-        r"([^\n])\s+(?=(?:Q|Qn|Question|Ans|Answer|प्रश्न|प्र|उत्तर)\s*\.?\s*\d+[\.:\)]?)",
+        r"([.\?!;\):])[ \t]+(?=\b(?:Question|Qn|Q|Ans|Answer|प्रश्न|प्र|उत्तर|উঃ|উত্তর)[ \t]*[:\.]?[ \t]*\d+[\.:\)]?)",
         r"\1\n", text, flags=re.IGNORECASE,
     )
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
     text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)  # Fix hyphenated line breaks
-    text = re.sub(r"^(\s*\d+)[\.\\)]\s+\1[\.\)]", r"\1.", text, flags=re.MULTILINE)
-    text = re.sub(r"^(\s*)Question\s+(\d+)\s*[:\.\)]\s*", r"\1\2. ", text, flags=re.IGNORECASE | re.MULTILINE)
-    text = re.sub(r"^(\s*)Q\.?\s*(\d+)\s*[\.\)]\s*", r"\1\2. ", text, flags=re.IGNORECASE | re.MULTILINE)
-    text = re.sub(r"^(\s*)\((\d+)\)\s*", r"\1\2. ", text, flags=re.MULTILINE)
+    text = re.sub(r"^([ \t\.\-\_]*\d+)[\.\\)]\s+\1[\.\)]", r"\1.", text, flags=re.MULTILINE)
+    
+    # Convert (1), (2) at line start to 1., 2.
+    text = re.sub(r"^([ \t\.\-\_]*)\((\d+)\)[ \t]*", r"\1\2. ", text, flags=re.MULTILINE)
+
+    # Standardize explicit headers (Question 1, Q1, Q.1, .. Q.1, -- Q.2, प्रश्न 1, Ans 1, उत्तर 1, উঃ 1) to Q.<num>.
+    text = re.sub(r"^([ \t\.\-\_\*\•]*)(?:Question|Qn|Q|प्रश्न|प्र|প্রশ্ন)[ \t]*[\.\:\-]?[ \t]*(\d+)[\.:\)\-]?[ \t]*", r"Q.\2. ", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^([ \t\.\-\_\*\•]*)(?:Ans|Answer|उत्तर|উঃ|উত্তর)[ \t]*[:\.\-]?[ \t]*(\d+)([\.:\)\-]|(?=\s*$))[ \t]*", r"Q.\2. ", text, flags=re.IGNORECASE | re.MULTILINE)
+
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.replace("\u201c", '"').replace("\u201d", '"')
@@ -1158,13 +1190,22 @@ def extract_page_images_from_image(img_bytes: bytes, session_id: str, filename: 
         return []
 
 
+def extract_page_images_from_bytes(file_bytes: bytes, session_id: str, doc_label: str = "student") -> List[str]:
+    """Smart page image extractor: handles both PDF documents and PNG/JPG/WEBP image files."""
+    if not file_bytes:
+        return []
+    if file_bytes.startswith(b"%PDF-"):
+        return extract_page_images_from_pdf(file_bytes, session_id, doc_label)
+    else:
+        return extract_page_images_from_image(file_bytes, session_id, f"{doc_label}.png")
+
+
 def get_targeted_pages_for_question(page_num: int, all_page_images: List[str]) -> List[str]:
     """Return ONLY the relevant page images for a question's answer (targeted crop)."""
     if page_num < 1 or not all_page_images:
         return []
     idx = page_num - 1
     result = []
-    # Include detected page + next page (answer may span 2 pages)
     for i in range(max(0, idx), min(len(all_page_images), idx + 2)):
         result.append(all_page_images[i])
     return result
@@ -1219,8 +1260,58 @@ def wrap_untrusted_student_text(text: str) -> str:
 #  SECTION 8: HYBRID ANSWER MAPPING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+EXPLICIT_QUESTION_PATTERNS = [
+    re.compile(r"^\s*(?:Question|Qn|Q|प्रश्न|प्र|প্রশ্ন)\s*[\.\:\-]*\s*(\d+)[\.:\)\-]?\s*", re.IGNORECASE),
+    re.compile(r"^\s*(?:Ans|Answer|उत्तर|উঃ|উত্তর)\s*[:\.\-]?\s*(\d+)(?:[\.:\)\-]|(?=\s*$))\s*", re.IGNORECASE),
+    re.compile(r"^\s*(\d+)[\.:\)]\s*(?:Ans|Answer|उत्तर|উঃ|Q|Question|प्रश्न)\b", re.IGNORECASE),
+]
+
+BARE_NUMBER_PATTERN = re.compile(r"^\s*(\d+)[\.:\)]\s+", re.IGNORECASE)
+
+SUBQUESTION_PATTERNS = [
+    re.compile(r"^\s*[\(\[]?([a-zA-Z])[\)\].:]\s+"),
+    re.compile(r"^\s*[\(\[]?([ivxlcdm]+)[\)\].:]\s+", re.IGNORECASE),
+]
+
+
+def classify_line(line: str) -> Tuple[str, Optional[str]]:
+    """
+    Context-aware line classifier for student OCR text:
+    Returns (LineType, Q_Tag) where LineType is one of:
+    - QUESTION_HEADER: Explicit header (authoritative boundary, e.g., Q1., Question 1, Ans 1, उत्तर 1)
+    - BARE_NUMBER: Line starting with a digit like 1., 2., 3.
+    - SUBQUESTION: Line starting with (a), (b), (i), (ii)
+    - SECTION_HEADER: Divider line or Section header
+    - CONTINUATION: Standard body/text content
+    """
+    stripped = line.strip()
+    if not stripped:
+        return "EMPTY", None
+
+    if re.match(r"^[-=_]{3,}$", stripped) or re.match(r"^SECTION\s+[A-Z]", stripped, re.IGNORECASE):
+        return "SECTION_HEADER", None
+
+    for pat in EXPLICIT_QUESTION_PATTERNS:
+        m = pat.match(stripped)
+        if m:
+            return "QUESTION_HEADER", f"Q.{m.group(1)}"
+
+    m_num = BARE_NUMBER_PATTERN.match(stripped)
+    if m_num:
+        return "BARE_NUMBER", f"Q.{m_num.group(1)}"
+
+    for pat in SUBQUESTION_PATTERNS:
+        m_sub = pat.match(stripped)
+        if m_sub:
+            return "SUBQUESTION", m_sub.group(1)
+
+    return "CONTENT", None
+
+
 def _generate_ocr_blocks(student_text: str) -> List[OCRBlock]:
-    """Generate answer blocks from student OCR text using header detection."""
+    """
+    Generate answer blocks from student OCR text using context-aware classification.
+    """
     if not student_text or not student_text.strip():
         return []
 
@@ -1231,12 +1322,16 @@ def _generate_ocr_blocks(student_text: str) -> List[OCRBlock]:
     current_q_id: Optional[str] = None
     block_id = 0
 
-    HEADER_PATTERNS = [
-        re.compile(r"^(?:Question|Qn|Q|प्रश्न|प्र)\s*\.?\s*(\d+)[\.:\)]?\s*", re.IGNORECASE),
-        re.compile(r"^(?:Ans|Answer|उत्तर)\s*\.?\s*(\d+)[\.:\)]?\s*", re.IGNORECASE),
-        re.compile(r"^\s*Q\.?\s*(\d+)[\.:\)]?\s*", re.IGNORECASE),
-        re.compile(r"^\s*(\d+)[\.:\)]\s+", re.IGNORECASE),
-    ]
+    # Collect all explicit question headers present in the document
+    explicit_headers_set: Set[str] = set()
+    for line in lines:
+        l_type, q_tag = classify_line(line)
+        if l_type == "QUESTION_HEADER" and q_tag:
+            explicit_headers_set.add(q_tag)
+
+    current_is_explicit = False
+    in_sublist = False
+    last_sublist_num = 0
 
     def flush():
         nonlocal block_id
@@ -1250,6 +1345,7 @@ def _generate_ocr_blocks(student_text: str) -> List[OCRBlock]:
                     detected_q_id=current_q_id,
                     line_count=len(current_lines),
                     word_count=len(raw.split()),
+                    is_explicit_header=current_is_explicit,
                 ))
                 block_id += 1
 
@@ -1260,25 +1356,56 @@ def _generate_ocr_blocks(student_text: str) -> List[OCRBlock]:
                 current_lines.append("")
             continue
 
-        detected_id: Optional[str] = None
-        for pat in HEADER_PATTERNS:
-            m = pat.match(stripped)
-            if m:
-                detected_id = f"Q.{m.group(1)}"
-                break
+        line_type, q_tag = classify_line(line)
+        should_flush = False
+        new_q_id = current_q_id
 
-        if not detected_id:
-            m_num = re.match(r"^Q\.?\s*(\d+)[\.:\)]?", stripped, re.IGNORECASE)
-            if m_num:
-                detected_id = f"Q.{m_num.group(1)}"
+        if line_type == "QUESTION_HEADER":
+            should_flush = True
+            new_q_id = q_tag
+            current_is_explicit = True
+            in_sublist = False
+            last_sublist_num = 0
+        elif line_type == "SECTION_HEADER":
+            should_flush = True
+            current_is_explicit = False
+            in_sublist = False
+            last_sublist_num = 0
+        elif line_type == "BARE_NUMBER":
+            if not explicit_headers_set:
+                m_val = re.search(r"\d+", q_tag)
+                num_val = int(m_val.group(0)) if m_val else 0
+                curr_q_num = 0
+                if current_q_id:
+                    m_curr = re.search(r"\d+", current_q_id)
+                    if m_curr:
+                        curr_q_num = int(m_curr.group(0))
 
-        is_divider = bool(re.match(r"^[-=_]{3,}$", stripped))
+                if current_q_id is None:
+                    should_flush = True
+                    new_q_id = q_tag
+                    current_is_explicit = False
+                    in_sublist = False
+                    last_sublist_num = 0
+                elif num_val <= curr_q_num:
+                    in_sublist = True
+                    last_sublist_num = num_val
+                elif in_sublist and num_val == last_sublist_num + 1:
+                    last_sublist_num = num_val
+                else:
+                    should_flush = True
+                    new_q_id = q_tag
+                    current_is_explicit = False
+                    in_sublist = False
+                    last_sublist_num = 0
+            else:
+                pass
 
-        if detected_id or is_divider:
+        if should_flush:
             flush()
             current_lines = [line]
             current_start = line_num
-            current_q_id = detected_id or current_q_id
+            current_q_id = new_q_id
         else:
             current_lines.append(line)
 
@@ -1289,6 +1416,7 @@ def _generate_ocr_blocks(student_text: str) -> List[OCRBlock]:
             block_id=0, raw_text=student_text.strip(),
             start_line=0, end_line=len(lines) - 1,
             line_count=len(lines), word_count=len(student_text.split()),
+            is_explicit_header=False,
         ))
     return blocks
 
@@ -1343,9 +1471,12 @@ def candidate_retrieval(
         if block.detected_q_id:
             b_num = _extract_q_number(block.detected_q_id)
             if q_num and b_num and q_num == b_num:
-                score.s_number = 1.0
-                score.composite = 0.95  # Direct explicit question header match!
-                return score
+                if block.is_explicit_header:
+                    score.s_number = 1.0
+                    score.composite = 0.95  # Direct explicit question header match!
+                    return score
+                else:
+                    score.s_number = 0.6
             elif q_num and b_num:
                 score.s_number = levenshtein_similarity(q_num, b_num) * 0.3
 
@@ -1600,15 +1731,34 @@ def evaluate_text_answer(evidence: EvidencePacket) -> TextEvalResult:
         return result
 
     # MCQ / Option fast path (instant evaluation — 0ms, no LLM needed)
-    student_opt = re.search(r"\(?([a-dA-D])\)?[\.\:\s\)]", student_ans)
-    model_opt = re.search(r"\(?([a-dA-D])\)?[\.\:\s\)]", model_ans)
+    # Require explicit bracketed options e.g. (a), (b), (c), (d) or labeled options in BOTH student & model answers
+    student_opt = re.search(r"\(([a-dA-D])\)", student_ans) or re.search(r"\b(?:option|विकल्प)\s*[:\-]?\s*([a-dA-D])\b", student_ans, re.IGNORECASE)
+    model_opt = re.search(r"\(([a-dA-D])\)", model_ans) or re.search(r"\b(?:option|विकल्प)\s*[:\-]?\s*([a-dA-D])\b", model_ans, re.IGNORECASE)
+    
     if student_opt and model_opt:
-        correct = student_opt.group(1).upper() == model_opt.group(1).upper()
+        student_letter = student_opt.group(1).upper()
+        model_letter = model_opt.group(1).upper()
+        correct = (student_letter == model_letter)
         result.score = evidence.rubric.text_marks if correct else 0.0
-        result.reasoning = f"MCQ Option ({student_opt.group(1).upper()}) {'matches' if correct else 'does not match'} expected ({model_opt.group(1).upper()})."
+        result.reasoning = f"MCQ Option ({student_letter}) {'matches' if correct else 'does not match'} expected ({model_letter})."
         result.parse_confidence = 1.0
         logger.info(f"[Fast-Path] {evidence.question_id} MCQ evaluation: score={result.score}/{evidence.rubric.text_marks}")
         return result
+
+    # Exact Text / Keyword Substring fast path (instant evaluation — 0ms, no LLM needed)
+    # If the exact reference answer word (e.g. "जलद") is contained inside student answer ("2. उत्तर : (b) जलद")
+    clean_model_strip = model_ans.strip()
+    if clean_model_strip and len(clean_model_strip) >= 2 and not evidence.rubric.has_diagram:
+        # Avoid matching generic short stop words like "is", "the", "a", "b", "c"
+        if clean_model_strip.lower() not in {"is", "am", "are", "the", "a", "b", "c", "d", "to", "of", "in"}:
+            if clean_model_strip.lower() in student_ans.lower():
+                result.score = evidence.rubric.text_marks
+                result.reasoning = f"Exact match found for reference answer '{clean_model_strip}' in student submission."
+                result.feedback = f"Your answer is correct. Well done!"
+                result.strengths = [f"Correctly identified '{clean_model_strip}'."]
+                result.parse_confidence = 1.0
+                logger.info(f"[Fast-Path] {evidence.question_id} Exact Substring Match ('{clean_model_strip}'): score={result.score}/{evidence.rubric.text_marks}")
+                return result
 
     # Build rubric
     rubric = _extract_text_rubric(model_ans, evidence.rubric.text_marks)
@@ -1683,8 +1833,8 @@ RESPOND ONLY WITH VALID JSON:
     return result
 
 
-def evaluate_diagram(evidence: EvidencePacket) -> VisualEvalResult:
-    """Evaluate visual/diagram answer using targeted page image crops."""
+def evaluate_diagram(evidence: EvidencePacket, cache_key: Optional[str] = None) -> VisualEvalResult:
+    """Evaluate visual/diagram answer using targeted page image crops (with pre-eval cache lookup)."""
     result = VisualEvalResult(max_marks=evidence.rubric.visual_marks)
 
     if evidence.rubric.visual_marks <= 0:
@@ -1697,12 +1847,33 @@ def evaluate_diagram(evidence: EvidencePacket) -> VisualEvalResult:
         result.skip_reason = f"Question type {evidence.question_type.value} has no visual component."
         return result
 
+    # ⚡ Check Parallel Visual Pre-Evaluation Cache (0ms latency!)
+    if cache_key:
+        with _cache_lock:
+            cached_map = _visual_eval_cache.get(cache_key)
+            if cached_map and evidence.question_id in cached_map:
+                logger.info(f"[VisualEval] Cache HIT for {evidence.question_id} in key={cache_key} (0ms latency)")
+                return cached_map[evidence.question_id]
+
     # Only send targeted page images (not full 30-page PDF)
     image_paths = []
     if evidence.student_page_images:
         image_paths.extend(evidence.student_page_images[:2])  # Max 2 pages
     if evidence.answer_key_page_images:
         image_paths.extend(evidence.answer_key_page_images[:1])
+
+    # ⚡ Early exit: If no physical images attached AND student text contains no visual keywords, skip diagram evaluation
+    student_ans_clean = (evidence.student_answer or "").strip()
+    has_diagram_keywords = any(kw in student_ans_clean.lower() for kw in ("diagram", "figure", "sketch", "draw", "चित्र", "आरेख", "रेखाचित्र"))
+    if not image_paths and not has_diagram_keywords:
+        result.skipped = True
+        result.score = 0.0
+        result.skip_reason = "No student diagram image or relevant visual response attached."
+        result.diagram_feedback = ""
+        return result
+
+    t_v = time.time()
+    logger.info(f"[VisualEval] {evidence.question_id}: Evaluating diagram with Qwen-VL (images={len(image_paths)}, max_marks={evidence.rubric.visual_marks})...")
 
     prompt = f"""You are an expert exam evaluator specializing in diagram and visual answer evaluation.
 
@@ -1745,6 +1916,9 @@ RESPOND ONLY WITH VALID JSON:
             result.labels_missing = [l for l in parsed.get("labels_missing", []) if isinstance(l, str)]
             result.diagram_accuracy = float(parsed.get("diagram_accuracy", score / max(evidence.rubric.visual_marks, 1)))
             result.parse_confidence = parse_conf
+
+            elapsed = round(time.time() - t_v, 2)
+            logger.info(f"[VisualEval] {evidence.question_id}: Qwen-VL evaluated diagram in {elapsed}s | score={score}/{evidence.rubric.visual_marks} | accuracy={result.diagram_accuracy:.0%}")
             return result
 
         except Exception as e:
@@ -1767,10 +1941,20 @@ def aggregate_marks(evidence: EvidencePacket, text_result: TextEvalResult, visua
     if final_score < 0:
         final_score = 0.0
 
-    # Status determination
-    student_ans = evidence.student_answer
-    if not student_ans or not student_ans.strip():
+    # Status & Unanswered determination
+    student_ans_clean = (evidence.student_answer or "").strip().lower()
+    is_unanswered = (
+        not student_ans_clean or
+        student_ans_clean in ("no answer", "unanswered", "no student answer response extracted.")
+    )
+
+    if is_unanswered and not evidence.student_page_images:
+        final_score = 0.0
         status = "Unanswered"
+    elif is_unanswered:
+        status = "Unanswered"
+        if visual_result.skipped:
+            final_score = 0.0
     elif final_score >= rubric.total_marks * 0.9:
         status = "Correct"
     elif final_score > 0:
@@ -2090,6 +2274,9 @@ def evidence_selector_node(state: PipelineGraphState) -> Dict[str, Any]:
 def parallel_evaluator_node(state: PipelineGraphState) -> Dict[str, Any]:
     """Agent 7: Evaluate all questions in controlled parallel (max_workers=3)."""
     evidence_packets = state.get("evidence_packets", [])
+    exam_id = state.get("exam_id", "1")
+    student_id = state.get("student_id", "1")
+    cache_key = f"{exam_id}_{student_id}"
     metadata = state.get("metadata", PipelineMetadata())
 
     t0 = time.time()
@@ -2097,7 +2284,7 @@ def parallel_evaluator_node(state: PipelineGraphState) -> Dict[str, Any]:
     def process_question(ev: EvidencePacket) -> AggregatedResult:
         t_q = time.time()
         text_res = evaluate_text_answer(ev)
-        visual_res = evaluate_diagram(ev)
+        visual_res = evaluate_diagram(ev, cache_key=cache_key)
         agg = aggregate_marks(ev, text_res, visual_res)
         logger.info(f"[Agent 7: Evaluator] {ev.question_id} evaluated in {round(time.time() - t_q, 2)}s: score={agg.final_score}/{agg.final_max_marks} ({agg.status})")
         return agg
@@ -2190,11 +2377,15 @@ def response_builder_node(state: PipelineGraphState) -> Dict[str, Any]:
         tr = agg.text_result
         vr = agg.visual_result
 
-        combined_feedback = tr.feedback or tr.reasoning or ""
-        if not vr.skipped and vr.diagram_feedback:
-            combined_feedback += f"\n[Diagram]: {vr.diagram_feedback}"
+        if agg.status == "Unanswered":
+            combined_strengths = []
+            combined_feedback = tr.feedback or "No answer submitted by student."
+        else:
+            combined_feedback = tr.feedback or tr.reasoning or ""
+            if not vr.skipped and vr.diagram_feedback:
+                combined_feedback += f"\n[Diagram]: {vr.diagram_feedback}"
+            combined_strengths = tr.strengths or ["Attempted solution."]
 
-        combined_strengths = tr.strengths or ["Attempted solution."]
         combined_missing = tr.missing_concepts or []
 
         conf_reason = (
@@ -2393,11 +2584,87 @@ async def health_check():
             "max_questions": MAX_QUESTIONS_SUPPORTED,
             "eval_concurrency": MAX_EVAL_CONCURRENCY,
             "rubric_caching": True,
+            "visual_pre_evaluation": True,
             "targeted_page_cropping": True,
             "non_destructive_security": True,
             "diagram_evaluation": True,
         },
         "rubric_cache_size": len(_rubric_cache),
+        "visual_cache_size": len(_visual_eval_cache),
+    }
+
+
+@app.post("/visual-pre-eval")
+async def visual_pre_eval_endpoint(req: VisualPreEvalRequest):
+    """Pre-evaluate visual/diagram questions in parallel while Chandra OCR runs."""
+    logger.info(f"[/visual-pre-eval] student_id={req.student_id}, exam_id={req.exam_id}")
+    t0 = time.time()
+    cache_key = f"{req.exam_id}_{req.student_id}"
+
+    # Parse questions & model answers (Agent 1)
+    clean_q = detect_and_parse_input(req.question_paper_text)
+    clean_a = normalize_ocr_text(detect_and_parse_input(req.answer_key_text))
+    questions = build_question_tree(clean_q, float(req.max_marks))
+    model_answers = parse_model_answers(clean_a, questions)
+
+    # Pre-process rubrics (Agent 3)
+    rubrics = preprocess_exam_rubrics(questions, model_answers, req.exam_id)
+    diagram_qs = [
+        q for q in questions
+        if rubrics.get(q.question_id, RubricAllocation(q.question_id, q.max_marks, q.max_marks, 0.0)).has_diagram
+    ]
+
+    if not diagram_qs:
+        return {
+            "status": "success",
+            "exam_id": req.exam_id,
+            "student_id": req.student_id,
+            "diagram_questions_count": 0,
+            "cached_count": 0,
+            "message": "No diagram questions in exam.",
+        }
+
+    # Extract page images from PDF/Image base64 if provided
+    session_id = hashlib.md5(f"{req.student_id}{req.exam_id}{t0}".encode()).hexdigest()[:12]
+    page_images: List[str] = []
+    if req.student_pdf_base64:
+        try:
+            file_bytes = base64.b64decode(req.student_pdf_base64)
+            page_images = extract_page_images_from_bytes(file_bytes, session_id, "student_preeval")
+            logger.info(f"[/visual-pre-eval] Extracted {len(page_images)} page image(s) from student file ({len(file_bytes)} bytes)")
+        except Exception as e:
+            logger.error(f"[/visual-pre-eval] PDF/Image base64 decode error: {e}")
+
+    cached_results: Dict[str, VisualEvalResult] = {}
+    logger.info(f"[/visual-pre-eval] Detected {len(diagram_qs)} diagram question(s) for key={cache_key}: {[q.question_id for q in diagram_qs]}")
+    for idx, q in enumerate(diagram_qs, 1):
+        rubric = rubrics[q.question_id]
+        expected_ans = model_answers.get(q.question_id, "")
+        evidence = EvidencePacket(
+            question_id=q.question_id,
+            question_text=q.question_text,
+            question_type=q.question_type,
+            expected_answer=expected_ans,
+            student_answer="",
+            rubric=rubric,
+            student_page_images=page_images,
+        )
+        logger.info(f"[/visual-pre-eval] [{idx}/{len(diagram_qs)}] Running Qwen-VL diagram evaluation for {q.question_id}...")
+        v_res = evaluate_diagram(evidence)
+        cached_results[q.question_id] = v_res
+
+    with _cache_lock:
+        _visual_eval_cache[cache_key] = cached_results
+
+    elapsed = round(time.time() - t0, 3)
+    logger.info(f"[/visual-pre-eval] Pre-evaluated {len(cached_results)} diagram questions in {elapsed}s for key={cache_key}")
+    return {
+        "status": "success",
+        "exam_id": req.exam_id,
+        "student_id": req.student_id,
+        "diagram_questions_count": len(diagram_qs),
+        "cached_count": len(cached_results),
+        "processing_time_seconds": elapsed,
     }
 
 
@@ -2405,6 +2672,17 @@ async def health_check():
 async def evaluate_text_endpoint(req: TextEvaluationRequest):
     """Primary JSON text API endpoint (backward compatible with Node.js backend)."""
     logger.info(f"[/evaluate-text] student_id={req.student_id}, exam_id={req.exam_id}")
+
+    student_page_images: List[str] = []
+    if req.student_pdf_base64:
+        try:
+            session_id = hashlib.md5(f"{req.student_id}{req.exam_id}{time.time()}".encode()).hexdigest()[:12]
+            file_bytes = base64.b64decode(req.student_pdf_base64)
+            student_page_images = extract_page_images_from_bytes(file_bytes, session_id, "student_text_api")
+            logger.info(f"[/evaluate-text] Extracted {len(student_page_images)} page image(s) from student file ({len(file_bytes)} bytes)")
+        except Exception as e:
+            logger.error(f"[/evaluate-text] PDF/Image base64 decode error: {e}")
+
     return run_pipeline6(
         question_paper_text=req.question_paper_text,
         answer_key_text=req.answer_key_text,
@@ -2412,6 +2690,7 @@ async def evaluate_text_endpoint(req: TextEvaluationRequest):
         student_id=req.student_id,
         exam_id=req.exam_id,
         default_max_marks=req.max_marks,
+        student_page_images=student_page_images,
     )
 
 
