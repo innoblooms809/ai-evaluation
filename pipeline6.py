@@ -95,6 +95,17 @@ MAX_QUESTIONS_SUPPORTED = 100
 MULTI_PAGE_MAX = 30
 HIGH_CONFIDENCE_THRESHOLD = 0.65
 LOW_CONFIDENCE_THRESHOLD = 0.35
+
+# ── Whole-sheet fallback (Stage 3 of answer mapping) ──
+# When the student's OCR text is unreliable, or the normal mapper could not place
+# most answers, the VL model reads the WHOLE student sheet (page images, else the
+# full OCR text) and maps the answers to the questions itself.
+OCR_FALLBACK_CONFIDENCE = LOW_CONFIDENCE_THRESHOLD  # OCR quality below this → re-read from page images
+MAPPING_FAILURE_RATIO = 0.5       # this share of questions (or more) left unmapped → mapping failed
+WHOLE_SHEET_MAX_PAGES = 12        # page images read by the fallback
+WHOLE_SHEET_TEXT_WINDOW = 3000    # text-only fallback: characters per window
+WHOLE_SHEET_TEXT_STEP = 2500      # text-only fallback: window step (500 chars overlap)
+WHOLE_SHEET_MIN_CONFIDENCE = 0.3  # ignore fallback answers the model is less sure about
 PAGE_IMAGE_DPI = 150
 PAGE_IMAGE_MAX_DIM = 1280
 TEMP_IMAGE_DIR = PROJECT_ROOT / "__temp_page_images__"
@@ -1266,6 +1277,7 @@ EXPLICIT_QUESTION_PATTERNS = [
     re.compile(r"^\s*(\d+)[\.:\)]\s*(?:Ans|Answer|उत्तर|উঃ|Q|Question|प्रश्न)\b", re.IGNORECASE),
 ]
 
+DOUBLE_BARE_NUMBER_PATTERN = re.compile(r"^\s*\d+[\.:\)]\s+(\d+)[\.:\)]\s+", re.IGNORECASE)
 BARE_NUMBER_PATTERN = re.compile(r"^\s*(\d+)[\.:\)]\s+", re.IGNORECASE)
 
 SUBQUESTION_PATTERNS = [
@@ -1279,7 +1291,7 @@ def classify_line(line: str) -> Tuple[str, Optional[str]]:
     Context-aware line classifier for student OCR text:
     Returns (LineType, Q_Tag) where LineType is one of:
     - QUESTION_HEADER: Explicit header (authoritative boundary, e.g., Q1., Question 1, Ans 1, उत्तर 1)
-    - BARE_NUMBER: Line starting with a digit like 1., 2., 3.
+    - BARE_NUMBER: Line starting with a digit like 1., 2., 3. or double prefix like 1. 5.
     - SUBQUESTION: Line starting with (a), (b), (i), (ii)
     - SECTION_HEADER: Divider line or Section header
     - CONTINUATION: Standard body/text content
@@ -1295,6 +1307,10 @@ def classify_line(line: str) -> Tuple[str, Optional[str]]:
         m = pat.match(stripped)
         if m:
             return "QUESTION_HEADER", f"Q.{m.group(1)}"
+
+    m_double = DOUBLE_BARE_NUMBER_PATTERN.match(stripped)
+    if m_double:
+        return "BARE_NUMBER", f"Q.{m_double.group(1)}"
 
     m_num = BARE_NUMBER_PATTERN.match(stripped)
     if m_num:
@@ -1577,12 +1593,16 @@ def hybrid_answer_mapping(
     student_ocr_text: str,
     model_answers: Dict[str, str],
     student_script: str = "Latin",
+    student_ocr_conf: float = 1.0,
+    student_page_images: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, float], Dict[str, Dict[str, float]], Dict[str, int]]:
     """
-    Hybrid 3-Stage Answer Mapping:
-        Stage 1: Deterministic candidate retrieval (7-signal DP) — ~2ms
-        Stage 2: VL adjudication for LOW confidence matches
-        Stage 3: Accept final mapping with confidence routing
+    Hybrid Answer Mapping:
+        Stage 1:  Deterministic candidate retrieval (7-signal DP) — ~2ms
+        Stage 2:  VL adjudication for LOW confidence matches
+        Stage 2b: LLM search of the student text for unmapped questions
+        Stage 3:  FALLBACK — whole-sheet reading when OCR confidence is low or
+                  mapping failed for most questions (see whole_sheet_fallback_mapping)
     """
     # Stage 1: Candidate Retrieval
     blocks = _generate_ocr_blocks(student_ocr_text)
@@ -1635,6 +1655,88 @@ Return ONLY valid JSON:
             except Exception as e:
                 logger.warning(f"[VL-Adjudicate] {q_id} failed: {e}")
 
+    # Stage 2b: LLM Fallback Retrieval for unmapped/empty questions
+    unmapped_ids = [q.question_id for q in questions
+                    if (conf_map.get(q.question_id, 0) < HIGH_CONFIDENCE_THRESHOLD
+                        and not aligned.get(q.question_id, "").strip())]
+
+    if unmapped_ids and student_ocr_text.strip():
+        logger.info(f"[Stage 2b: LLM Fallback] {len(unmapped_ids)} unmapped questions: {unmapped_ids}")
+        for q_id in unmapped_ids:
+            q = next((q for q in questions if q.question_id == q_id), None)
+            if not q:
+                continue
+
+            try:
+                # Truncate student text to fit context window reasonably
+                student_text_truncated = student_ocr_text[:3000]
+                model_ans = model_answers.get(q_id, '')[:400]
+
+                prompt = f"""You are an expert at reading student exam answer sheets. The automatic answer mapper failed to find the student's answer for the question below.
+
+Search through the FULL student answer sheet text and extract ONLY the text that is the student's answer to this specific question. The student may have written the answer without a clear question number header.
+
+Question ({q_id}): {q.question_text[:400]}
+Expected/Model Answer (for reference): {model_ans}
+
+=== FULL STUDENT ANSWER SHEET TEXT ===
+{student_text_truncated}
+=== END OF STUDENT TEXT ===
+
+Return ONLY valid JSON:
+{{"found": true/false, "answer_text": "the exact extracted student answer text", "confidence": 0.0-1.0, "reasoning": "brief explanation of how you identified this answer"}}
+
+If the student did not answer this question at all, return {{"found": false, "answer_text": "", "confidence": 0.0, "reasoning": "not found in student sheet"}}"""
+
+                raw = generate_with_vl(prompt, max_new_tokens=600)
+                m = re.search(r"\{.*\}", raw, re.DOTALL)
+                if m:
+                    data = json.loads(m.group(0))
+                    found = data.get("found", False)
+                    answer_text = data.get("answer_text", "").strip()
+                    vl_conf = float(data.get("confidence", 0.0))
+
+                    if found and answer_text and vl_conf >= 0.3:
+                        aligned[q_id] = answer_text
+                        conf_map[q_id] = round(vl_conf, 3)
+                        sig_map[q_id] = {"composite": round(vl_conf, 3), "llm_fallback": True}
+                        page_map[q_id] = _detect_page_for_block(student_ocr_text, answer_text)
+                        logger.info(f"[Stage 2b: LLM Fallback] {q_id}: FOUND (conf={vl_conf:.2f}, len={len(answer_text)})")
+                    else:
+                        logger.info(f"[Stage 2b: LLM Fallback] {q_id}: NOT FOUND (conf={vl_conf:.2f})")
+            except Exception as e:
+                logger.warning(f"[Stage 2b: LLM Fallback] {q_id} failed: {e}")
+
+    # Stage 3: Whole-sheet FALLBACK.
+    # Triggered when (a) the OCR text itself is unreliable, or (b) the stages above
+    # still left most questions unmapped. The VL model then reads the whole student
+    # sheet and maps every answer to its question, instead of trusting the OCR text.
+    ocr_low = student_ocr_conf < OCR_FALLBACK_CONFIDENCE
+    unmapped_now = [q.question_id for q in questions if not aligned.get(q.question_id, "").strip()]
+    mapping_failed = bool(questions) and len(unmapped_now) / len(questions) >= MAPPING_FAILURE_RATIO
+
+    if ocr_low or mapping_failed:
+        reads_images = bool(student_page_images)
+        if ocr_low and reads_images:
+            # OCR text is garbage → re-read EVERY question straight from the page images.
+            target_ids = [q.question_id for q in questions]
+        else:
+            # OCR is usable but mapping failed → only fill the gaps / weak matches.
+            target_ids = [q.question_id for q in questions
+                          if not aligned.get(q.question_id, "").strip()
+                          or conf_map.get(q.question_id, 0.0) < HIGH_CONFIDENCE_THRESHOLD]
+        logger.info(
+            f"[Stage 3: Whole-sheet] Fallback triggered (ocr_conf={student_ocr_conf:.2f}, "
+            f"unmapped={len(unmapped_now)}/{len(questions)}, source={'page images' if reads_images else 'OCR text'}) "
+            f"for {len(target_ids)} question(s)"
+        )
+        remapped = whole_sheet_fallback_mapping(
+            questions, student_ocr_text, student_page_images or [],
+            aligned, conf_map, sig_map, page_map, target_ids,
+            prefer_fallback=ocr_low and reads_images,
+        )
+        logger.info(f"[Stage 3: Whole-sheet] Re-mapped {remapped} question(s)")
+
     # Fill unmapped
     for q in questions:
         if q.question_id not in aligned:
@@ -1644,6 +1746,136 @@ Return ONLY valid JSON:
             page_map[q.question_id] = -1
 
     return aligned, conf_map, sig_map, page_map
+
+
+def _normalize_question_ref(ref: Any, valid_ids: List[str]) -> Optional[str]:
+    """Match a question reference from the model ("Q.3", "Q3", "3", "4a") to a known question_id."""
+    s = str(ref or "").strip()
+    if s in valid_ids:
+        return s
+    m = re.match(r"^[Qq]?\s*\.?\s*(\d+)(?:[.\s]*\(?([a-zA-Z]|\d+)\)?)?$", s)
+    if not m:
+        return None
+    num, sub = m.group(1), (m.group(2) or "").lower()
+    candidates = [f"Q.{num}{sub}", f"Q.{num}.{sub}", f"Q{num}{sub}", f"{num}{sub}"] if sub else [f"Q.{num}", f"Q{num}", num]
+    return next((c for c in candidates if c in valid_ids), None)
+
+
+def _parse_fallback_answers(raw: str) -> List[Dict[str, Any]]:
+    """Pull the `answers` list out of the model's JSON reply (tolerates extra prose)."""
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return []
+    items = data.get("answers", []) if isinstance(data, dict) else []
+    return [i for i in items if isinstance(i, dict)]
+
+
+def whole_sheet_fallback_mapping(
+    questions: List[ExtractedQuestion],
+    student_ocr_text: str,
+    student_page_images: List[str],
+    aligned: Dict[str, str],
+    conf_map: Dict[str, float],
+    sig_map: Dict[str, Dict[str, Any]],
+    page_map: Dict[str, int],
+    target_ids: List[str],
+    prefer_fallback: bool = False,
+) -> int:
+    """
+    Stage 3 — FALLBACK: the VL model reads the WHOLE student answer sheet and maps
+    each answer to its question itself.
+
+    • With page images (the Node backend always sends the original sheet) every
+      page is read directly (up to WHOLE_SHEET_MAX_PAGES), so bad OCR no longer
+      matters. An answer that continues on the next page is joined together.
+    • Without images, the FULL OCR text is scanned in overlapping windows — not only
+      the first 3000 characters like Stage 2b.
+
+    A fallback answer replaces the current mapping when the question had none, when
+    the fallback is more confident, or — with `prefer_fallback` (low OCR confidence
+    + page images) — whenever the fallback found it, since the OCR-based text is
+    the unreliable one. Updates the maps in place; returns how many questions changed.
+    """
+    targets = [q for q in questions if q.question_id in set(target_ids)]
+    if not targets:
+        return 0
+
+    valid_ids = [q.question_id for q in targets]
+    question_list = "\n".join(f"- {q.question_id}: {q.question_text[:160]}" for q in targets)
+    reply_format = f"""Questions to look for:
+{question_list}
+
+Return ONLY valid JSON:
+{{"answers": [{{"question_id": "{valid_ids[0]}", "answer_text": "the exact answer written by the student", "confidence": 0.0-1.0}}]}}
+Include only questions whose answer appears here. Copy the student's words exactly — do not correct, complete or add to them."""
+
+    # q_id → {"texts": [...parts in reading order], "conf": best confidence, "page": first page}
+    found: Dict[str, Dict[str, Any]] = {}
+
+    def collect(items: List[Dict[str, Any]], page_no: int) -> None:
+        for item in items:
+            q_id = _normalize_question_ref(item.get("question_id"), valid_ids)
+            text = str(item.get("answer_text") or "").strip()
+            try:
+                conf = float(item.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                conf = 0.0
+            if not q_id or not text or conf < WHOLE_SHEET_MIN_CONFIDENCE:
+                continue
+            entry = found.setdefault(q_id, {"texts": [], "conf": 0.0, "page": page_no})
+            if text not in entry["texts"]:
+                entry["texts"].append(text)  # answer may continue across pages / windows
+            entry["conf"] = max(entry["conf"], conf)
+
+    if student_page_images:
+        pages = student_page_images[:WHOLE_SHEET_MAX_PAGES]
+        for page_no, image_path in enumerate(pages, start=1):
+            prompt = (
+                f"You are reading page {page_no} of {len(pages)} of a handwritten student exam answer sheet. "
+                f"Find the student's answers written on THIS page for the questions below. "
+                f"Answers may not have clear question numbers — use the content to decide which question they answer.\n\n"
+                + reply_format
+            )
+            try:
+                raw = generate_with_vl(prompt, image_paths=[image_path], max_new_tokens=900)
+                collect(_parse_fallback_answers(raw), page_no)
+            except Exception as e:
+                logger.warning(f"[Stage 3: Whole-sheet] Page {page_no} failed: {e}")
+    elif student_ocr_text.strip():
+        text = student_ocr_text
+        overlap = WHOLE_SHEET_TEXT_WINDOW - WHOLE_SHEET_TEXT_STEP
+        for start in range(0, max(len(text) - overlap, 1), WHOLE_SHEET_TEXT_STEP):
+            chunk = text[start:start + WHOLE_SHEET_TEXT_WINDOW]
+            prompt = (
+                f"You are reading part of the OCR text of a student exam answer sheet "
+                f"(characters {start}–{start + len(chunk)} of {len(text)}). "
+                f"Find the student's answers in THIS part for the questions below.\n\n"
+                f"=== STUDENT TEXT ===\n{chunk}\n=== END ===\n\n" + reply_format
+            )
+            try:
+                raw = generate_with_vl(prompt, max_new_tokens=900)
+                collect(_parse_fallback_answers(raw), _detect_page_for_block(text, chunk[:200]))
+            except Exception as e:
+                logger.warning(f"[Stage 3: Whole-sheet] Text window at {start} failed: {e}")
+
+    remapped = 0
+    for q_id, entry in found.items():
+        new_text = "\n".join(entry["texts"]).strip()
+        new_conf = round(entry["conf"], 3)
+        current = aligned.get(q_id, "").strip()
+        if prefer_fallback or not current or new_conf > conf_map.get(q_id, 0.0):
+            aligned[q_id] = new_text
+            conf_map[q_id] = new_conf
+            sig_map[q_id] = {**sig_map.get(q_id, {}), "composite": new_conf, "whole_sheet_fallback": True}
+            if entry["page"] and entry["page"] > 0:
+                page_map[q_id] = entry["page"]
+            remapped += 1
+
+    return remapped
 
 
 def _resolve_model_answer(q_id: str, model_answers: Dict[str, str]) -> str:
@@ -2126,8 +2358,11 @@ def hybrid_answer_mapper_node(state: PipelineGraphState) -> Dict[str, Any]:
     metadata = state.get("metadata", PipelineMetadata())
 
     t0 = time.time()
+    # OCR confidence + page images enable the whole-sheet fallback (Stage 3).
     aligned_texts, confidence_map, signal_map, page_map = hybrid_answer_mapping(
         questions, clean_student, model_answers, student_script,
+        student_ocr_conf=state.get("student_ocr_conf", 1.0),
+        student_page_images=state.get("student_page_images", []),
     )
     metadata.mapping_time_seconds = round(time.time() - t0, 3)
 
@@ -2637,21 +2872,25 @@ async def visual_pre_eval_endpoint(req: VisualPreEvalRequest):
 
     cached_results: Dict[str, VisualEvalResult] = {}
     logger.info(f"[/visual-pre-eval] Detected {len(diagram_qs)} diagram question(s) for key={cache_key}: {[q.question_id for q in diagram_qs]}")
-    for idx, q in enumerate(diagram_qs, 1):
-        rubric = rubrics[q.question_id]
-        expected_ans = model_answers.get(q.question_id, "")
-        evidence = EvidencePacket(
-            question_id=q.question_id,
-            question_text=q.question_text,
-            question_type=q.question_type,
-            expected_answer=expected_ans,
-            student_answer="",
-            rubric=rubric,
-            student_page_images=page_images,
-        )
-        logger.info(f"[/visual-pre-eval] [{idx}/{len(diagram_qs)}] Running Qwen-VL diagram evaluation for {q.question_id}...")
-        v_res = evaluate_diagram(evidence)
-        cached_results[q.question_id] = v_res
+    try:
+        for idx, q in enumerate(diagram_qs, 1):
+            rubric = rubrics[q.question_id]
+            expected_ans = model_answers.get(q.question_id, "")
+            evidence = EvidencePacket(
+                question_id=q.question_id,
+                question_text=q.question_text,
+                question_type=q.question_type,
+                expected_answer=expected_ans,
+                student_answer="",
+                rubric=rubric,
+                student_page_images=page_images,
+            )
+            logger.info(f"[/visual-pre-eval] [{idx}/{len(diagram_qs)}] Running Qwen-VL diagram evaluation for {q.question_id}...")
+            v_res = evaluate_diagram(evidence)
+            cached_results[q.question_id] = v_res
+    finally:
+        # Page images are temporary — the cached results below are all that is kept.
+        cleanup_session_images(session_id)
 
     with _cache_lock:
         _visual_eval_cache[cache_key] = cached_results
@@ -2673,25 +2912,34 @@ async def evaluate_text_endpoint(req: TextEvaluationRequest):
     """Primary JSON text API endpoint (backward compatible with Node.js backend)."""
     logger.info(f"[/evaluate-text] student_id={req.student_id}, exam_id={req.exam_id}")
 
+    # The original sheet's page images feed diagram evaluation and the whole-sheet
+    # fallback (Stage 3) used when OCR confidence is low or answer mapping fails.
     student_page_images: List[str] = []
+    session_id = hashlib.md5(f"{req.student_id}{req.exam_id}{time.time()}".encode()).hexdigest()[:12]
     if req.student_pdf_base64:
         try:
-            session_id = hashlib.md5(f"{req.student_id}{req.exam_id}{time.time()}".encode()).hexdigest()[:12]
             file_bytes = base64.b64decode(req.student_pdf_base64)
             student_page_images = extract_page_images_from_bytes(file_bytes, session_id, "student_text_api")
             logger.info(f"[/evaluate-text] Extracted {len(student_page_images)} page image(s) from student file ({len(file_bytes)} bytes)")
         except Exception as e:
             logger.error(f"[/evaluate-text] PDF/Image base64 decode error: {e}")
 
-    return run_pipeline6(
-        question_paper_text=req.question_paper_text,
-        answer_key_text=req.answer_key_text,
-        student_answer_text=req.student_answer_text,
-        student_id=req.student_id,
-        exam_id=req.exam_id,
-        default_max_marks=req.max_marks,
-        student_page_images=student_page_images,
-    )
+    try:
+        return run_pipeline6(
+            question_paper_text=req.question_paper_text,
+            answer_key_text=req.answer_key_text,
+            student_answer_text=req.student_answer_text,
+            student_id=req.student_id,
+            exam_id=req.exam_id,
+            default_max_marks=req.max_marks,
+            student_page_images=student_page_images,
+        )
+    finally:
+        # Page images are temporary — remove them once this sheet is evaluated.
+        cleanup_session_images(session_id)
+        # The diagram pre-scan cache for this sheet has been used — free the memory.
+        with _cache_lock:
+            _visual_eval_cache.pop(f"{req.exam_id}_{req.student_id}", None)
 
 
 @app.post("/evaluate-paper", response_model=EvaluationResponse)
