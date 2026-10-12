@@ -42,9 +42,11 @@ import math
 import time
 import logging
 import hashlib
+import html
 import unicodedata
 import threading
 import functools
+import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Any, List, Dict, Tuple, Set
@@ -84,8 +86,8 @@ os.environ["KMP_BLOCKTIME"] = "1"
 torch.set_num_threads(OPTIMAL_TORCH_THREADS)
 
 # ── Pipeline Constants ──
-PIPELINE_VERSION = "6.3.0"
-PROMPT_VERSION = "v6.3"
+PIPELINE_VERSION = "6.5.0-production-leaf-safe"
+PROMPT_VERSION = "v6.5-production-leaf-safe"
 VL_MODEL_VERSION = "Qwen2.5-VL-3B-Instruct"
 OCR_SERVER_URL = os.getenv("OCR_SERVER_URL", "http://localhost:8000/ocrOutput")
 DEFAULT_MAX_MARKS = 5
@@ -95,6 +97,10 @@ MAX_QUESTIONS_SUPPORTED = 100
 MULTI_PAGE_MAX = 30
 HIGH_CONFIDENCE_THRESHOLD = 0.65
 LOW_CONFIDENCE_THRESHOLD = 0.35
+
+SUBPART_LOG_MAX_TEXT = 240
+STRICT_SUBPART_EVALUATION = True
+WHOLE_SHEET_REQUIRE_ANSWER_STRUCTURE = True
 
 # ── Whole-sheet fallback (Stage 3 of answer mapping) ──
 # When the student's OCR text is unreliable, or the normal mapper could not place
@@ -108,7 +114,7 @@ WHOLE_SHEET_TEXT_STEP = 2500      # text-only fallback: window step (500 chars o
 WHOLE_SHEET_MIN_CONFIDENCE = 0.3  # ignore fallback answers the model is less sure about
 PAGE_IMAGE_DPI = 150
 PAGE_IMAGE_MAX_DIM = 1280
-TEMP_IMAGE_DIR = PROJECT_ROOT / "__temp_page_images__"
+TEMP_IMAGE_DIR = Path(tempfile.gettempdir()) / "pipeline6_temp_images"
 
 # 7-Signal Feature Weights for DP Alignment
 WEIGHT_NUMBER = 0.28
@@ -182,7 +188,7 @@ _vl_processor = None
 USE_4BIT_QUANTIZATION = os.getenv("USE_4BIT_QUANTIZATION", "false").lower() == "true"
 
 # // Set MAX_EVAL_CONCURRENCY = 8 for 80GB VRAM / 24+ CPU Core enterprise servers to evaluate 8 questions in parallel!
-MAX_EVAL_CONCURRENCY = int(os.getenv("MAX_EVAL_CONCURRENCY", "8"))
+MAX_EVAL_CONCURRENCY = int(os.getenv("MAX_EVAL_CONCURRENCY", "3"))
 
 
 def get_vl_model():
@@ -271,8 +277,8 @@ def generate_with_vl(prompt: str, image_paths: Optional[List[str]] = None, max_n
                 generated_ids = model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
-                    temperature=0.1,
-                    do_sample=True,
+                    temperature=0.0,
+                    do_sample=False,
                 )
 
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
@@ -298,6 +304,9 @@ class QuestionType(str, Enum):
     SHORT_ANSWER = "short_answer"
     LONG_ANSWER = "long_answer"
     CODE = "code"
+    COMPARISON = "comparison"
+    ASSERTION_REASON = "assertion_reason"
+    MATCH = "match"
     UNKNOWN = "unknown"
 
 
@@ -323,13 +332,15 @@ class RubricAllocation:
 
 @dataclass
 class EvidencePacket:
-    """Question-level evidence assembled for evaluation."""
+    """Leaf-question evidence assembled for evaluation."""
     question_id: str
     question_text: str
     question_type: QuestionType
     expected_answer: str
     student_answer: str
     rubric: RubricAllocation
+    parent_question_id: Optional[str] = None
+    subpart_label: str = ""
     student_page_images: List[str] = dc_field(default_factory=list)
     answer_key_page_images: List[str] = dc_field(default_factory=list)
     alignment_confidence: float = 1.0
@@ -415,6 +426,10 @@ class AlignmentScore:
 class ExtractedQuestion(BaseModel):
     question_id: str
     question_text: str
+    # Parent/container id for hierarchical questions such as Q.10.i.
+    # Leaf questions (normal questions) have parent_question_id=None.
+    parent_question_id: Optional[str] = None
+    parent_max_marks: Optional[float] = None
     question_type: QuestionType = QuestionType.UNKNOWN
     max_marks: float = DEFAULT_MAX_MARKS
     has_explicit_marks: bool = False
@@ -424,6 +439,7 @@ class ExtractedQuestion(BaseModel):
     extraction_confidence: float = 1.0
     text_marks: float = 0.0
     visual_marks: float = 0.0
+
 
 
 class ConceptScore(BaseModel):
@@ -479,6 +495,8 @@ class QuestionEvalDetail(BaseModel):
 
 class QuestionItem(BaseModel):
     questionId: str
+    parentQuestionId: Optional[str] = None
+    subpartLabel: str = ""
     questionText: str
     studentAnswer: str
     expectedAnswer: str
@@ -507,7 +525,7 @@ class FeedbackDetail(BaseModel):
 
 class MetadataDetail(BaseModel):
     model: str = VL_MODEL_VERSION
-    evaluationVersion: str = "v6.3"
+    evaluationVersion: str = PIPELINE_VERSION
     processingTime: float = 0.0
     timestamp: str = ""
     alignmentStats: Dict[str, Any] = Field(default_factory=dict)
@@ -744,44 +762,905 @@ def calculate_concept_coverage(student: str, model: str) -> float:
 
 
 def _parse_marks_from_text(text: str, default: float) -> Tuple[float, bool]:
-    m = re.search(
-        r"(?:\[|\()\s*(?:Marks?\s*:\s*)?(\d+\.?\d*)\s*(?:marks?|pts?|m)?\s*(?:\]|\))|marks?\s*:\s*(\d+\.?\d*)",
-        text, re.IGNORECASE,
+    """Parse one explicit marks value from a single question/sub-question."""
+    if not text:
+        return default, False
+
+    patterns = [
+        r"\bmarks?\s*[:=\-]\s*(\d+(?:\.\d+)?)",
+        r"[\(\[]\s*(\d+(?:\.\d+)?)\s*(?:marks?|pts?|m)\s*[\)\]]",
+        r"\b(\d+(?:\.\d+)?)\s*(?:marks?|pts?|m)\b",
+        r"[\(\[]\s*(\d+(?:\.\d+)?)\s*[\)\]]",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1)), True
+            except (TypeError, ValueError):
+                pass
+    return float(default), False
+
+
+def _clean_question_text(text: str) -> str:
+    """Remove only explicit marks annotations; preserve the actual question wording."""
+    if not text:
+        return ""
+    cleaned = re.sub(
+        r"\s*\[PARENT_TOTAL:\s*\d+(?:\.\d+)?\]",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*(?:\[|\()\s*(?:Marks?\s*[:=\-]\s*)?\d+(?:\.\d+)?\s*(?:marks?|pts?|m)?\s*(?:\]|\))",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_qid(qid: str) -> str:
+    """Normalize common question-id spellings to Q.<main>[.<sub>]."""
+    s = str(qid or "").strip()
+    s = re.sub(r"^[Qq]\s*\.??\s*", "", s)
+    s = s.strip(" .:)-")
+    s = re.sub(r"\s*\.\s*", ".", s)
+    s = re.sub(r"\s+", "", s)
+    return f"Q.{s}" if s else ""
+
+
+def _roman_to_int(value: str) -> Optional[int]:
+    values = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+    s = str(value or "").lower()
+    if not s or any(ch not in values for ch in s):
+        return None
+    total = 0
+    prev = 0
+    for ch in reversed(s):
+        cur = values[ch]
+        total += -cur if cur < prev else cur
+        prev = cur
+    return total
+
+
+def _sub_id(parent_id: str, sub: str) -> str:
+    """Return a canonical hierarchical subquestion id."""
+    sub = str(sub or "").strip().lower().strip("()[] .:)")
+    if re.fullmatch(r"[ivxlcdm]+", sub, re.IGNORECASE):
+        return f"{parent_id}.{sub}"
+    if re.fullmatch(r"[a-z]", sub, re.IGNORECASE):
+        return f"{parent_id}.{sub}"
+    if re.fullmatch(r"\d+", sub):
+        return f"{parent_id}.{sub}"
+    return f"{parent_id}.{sub}" if sub else parent_id
+
+
+def _question_header_match(line: str) -> Optional[Tuple[str, str]]:
+    """Parse a question header without confusing normal words with subparts.
+
+    Valid hierarchical suffixes are deliberately restricted to:
+      Q.10.a, Q.10.i, Q.10.1
+    A word such as ``Q.10.write`` is treated as a malformed main-question
+    header and becomes ``Q.10`` with ``write`` retained as question text.
+    """
+    s = str(line or "").strip()
+    if not s:
+        return None
+
+    # Explicit hierarchical ID.  Only one-letter alpha, Roman, or numeric
+    # suffixes are structural subparts.  Never accept arbitrary words here.
+    # \b after the label ensures "W" in "What" and "S" in "Simplify" are
+    # never mistaken for a subpart — a label must end at a word boundary
+    # (i.e. the next character is NOT a letter/digit).
+    m = re.match(
+        r"^(?:Question|Qn|Q|Ans|Answer|Expected\s+Answer|प्रश्न|प्र|প্রশ্ন)"
+        r"\s*\.?\s*(\d+)\s*\.\s*([a-zA-Z]\b|[ivxlcdm]+\b|\d+)"
+        r"\s*[\.:)\-]?\s*(.*)$",
+        s, re.IGNORECASE,
     )
     if m:
-        val = m.group(1) or m.group(2)
-        try:
-            return float(val), True
-        except ValueError:
-            pass
-    return default, False
+        parent = f"Q.{m.group(1)}"
+        suffix = m.group(2).lower()
+        return f"{parent}.{suffix}", m.group(3).strip()
+
+    # Malformed hierarchical header such as Q.1.write -> Q.1 + "write ...".
+    m = re.match(
+        r"^(?:Question|Qn|Q|Ans|Answer|Expected\s+Answer)"
+        r"\s*\.?\s*(\d+)\s*\.\s*([a-zA-Z][a-zA-Z0-9_-]*)"
+        r"\s*(.*)$",
+        s, re.IGNORECASE,
+    )
+    if m:
+        parent = f"Q.{m.group(1)}"
+        text = f"{m.group(2)} {m.group(3)}".strip()
+        return parent, text
+
+    # Normal main question header.
+    m = re.match(
+        r"^(?:Question|Qn|Q|Ans|Answer|Expected\s+Answer|प्रश्न|प्र|প্রশ্ন)"
+        r"\s*\.?\s*(\d+)\s*(?:[.):\-]\s*(.*)|$)",
+        s, re.IGNORECASE,
+    )
+    if m:
+        return f"Q.{m.group(1)}", (m.group(2) or "").strip()
+
+    m = re.match(r"^(\d+)\s*[.):\-]\s*(.*)$", s)
+    if m:
+        return f"Q.{m.group(1)}", m.group(2).strip()
+    return None
+
+
+def _extract_type_marker(text: str) -> Tuple[str, str]:
+    if not text:
+        return "", ""
+    m = re.search(r"\[\[TYPE\s*:\s*([^\]]+)\]\]", text, re.IGNORECASE)
+    explicit = m.group(1).strip().lower() if m else ""
+    cleaned = re.sub(r"\s*\[\[TYPE\s*:\s*[^\]]+\]\]", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned, explicit
+
+
+def _question_parent_id(qid: str) -> Optional[str]:
+    parts = str(qid or "").split(".")
+    return ".".join(parts[:2]) if len(parts) >= 3 else None
+
+
+def _question_subpart_label(qid: str) -> str:
+    parts = str(qid or "").split(".")
+    return ".".join(parts[2:]) if len(parts) >= 3 else ""
+
+
+def _log_question_tree(questions: List[ExtractedQuestion], stage: str) -> None:
+    logger.info("[SUBPART DEBUG] ===== %s QUESTION TREE =====", stage)
+    parents: Dict[str, List[ExtractedQuestion]] = {}
+    for q in questions:
+        if q.parent_question_id:
+            parents.setdefault(q.parent_question_id, []).append(q)
+        logger.info(
+            "[SUBPART DEBUG] leaf=%s | parent=%s | subpart=%s | marks=%.2f | type=%s | text=%r",
+            q.question_id, q.parent_question_id or "<none>",
+            _question_subpart_label(q.question_id) or "<root>", q.max_marks,
+            q.question_type.value, q.question_text[:SUBPART_LOG_MAX_TEXT],
+        )
+    for parent, children in parents.items():
+        logger.info(
+            "[SUBPART DEBUG] PARENT=%s | children=%s | child_marks_sum=%.2f",
+            parent, [c.question_id for c in children],
+            sum(c.max_marks for c in children),
+        )
+    logger.info("[SUBPART DEBUG] ===== END QUESTION TREE =====")
+
+
+def _validate_leaf_question_invariant(questions: List[ExtractedQuestion]) -> None:
+    ids = {q.question_id for q in questions}
+    parents = {q.parent_question_id for q in questions if q.parent_question_id}
+    bad = sorted(parents & ids)
+    if bad:
+        raise ValueError(f"Parent IDs also present as evaluation leaves: {bad}")
+
+
+def _split_inline_subpart_line(rest: str, parent_id: str) -> Tuple[str, List[Tuple[str, str]], bool]:
+    """Split real inline subquestions, but keep normal MCQ options together.
+
+    Examples split:
+        Solve (a) ... (b) ... (c) ...
+        Write (i) ... (ii) ... (iii) ...
+
+    Example intentionally NOT split:
+        Which is correct? (a) ... (b) ... (c) ... (d) ...
+    """
+    if not rest:
+        return "", [], False
+
+    marker_re = re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"(\([a-zA-Z]\)|\([ivxlcdm]+\)|\(\d+\))"
+        r"\s+",
+        re.IGNORECASE,
+    )
+    matches = list(marker_re.finditer(rest))
+    if len(matches) < 2:
+        return rest.strip(), [], False
+
+    parsed: List[Tuple[str, str]] = []
+    for i, match in enumerate(matches):
+        label = re.sub(r"[^a-zA-Z0-9]", "", match.group(1)).lower()
+        stop = matches[i + 1].start() if i + 1 < len(matches) else len(rest)
+        content = rest[match.end():stop].strip(" ;:-")
+        if content:
+            parsed.append((label, content))
+
+    if len(parsed) < 2:
+        return rest.strip(), [], False
+
+    labels = [label for label, _ in parsed]
+    prefix = rest[:matches[0].start()].strip(" :;-\n")
+
+    # Four consecutive alpha choices are the standard MCQ shape.  If the DB
+    # provides an explicit type, that type is handled by the caller; for plain
+    # text, this is the safest default and prevents Q1-Q8 from becoming leaves.
+    if labels == ["a", "b", "c", "d"]:
+        return rest.strip(), [], False
+
+    # Assertion/Reason commonly has four answer-choice options. Keep it intact.
+    if re.search(r"assertion\s*[-–]?\s*reason", prefix, re.IGNORECASE):
+        return rest.strip(), [], False
+
+    # A marker sequence is a subquestion only when it is structurally coherent.
+    alpha = all(re.fullmatch(r"[a-z]", x, re.IGNORECASE) for x in labels)
+    roman = all(re.fullmatch(r"[ivxlcdm]+", x, re.IGNORECASE) for x in labels)
+    numeric = all(x.isdigit() for x in labels)
+    if not (alpha or roman or numeric):
+        return rest.strip(), [], False
+
+    # Do not treat isolated option-like text as parts unless the sequence has
+    # at least two consecutive labels.
+    if alpha:
+        expected = list("abcdefghijklmnopqrstuvwxyz")
+        positions = [expected.index(x) for x in labels if x in expected]
+        if positions != list(range(positions[0], positions[0] + len(positions))):
+            return rest.strip(), [], False
+    elif roman:
+        nums = [_roman_to_int(x) for x in labels]
+        if any(n is None for n in nums) or nums != list(range(nums[0], nums[0] + len(nums))):
+            return rest.strip(), [], False
+    elif numeric:
+        nums = [int(x) for x in labels]
+        if nums != list(range(nums[0], nums[0] + len(nums))):
+            return rest.strip(), [], False
+
+    if parsed:
+        last_label, last_content = parsed[-1]
+        m_trail = re.search(
+            r"\s*(?:\[|\()\s*(?:total\s*)?(?:marks?\s*[:=\-]?\s*)?(\d+(?:\.\d+)?)\s*(?:marks?|pts?|m)?\s*(?:\]|\))\s*$",
+            last_content,
+            re.IGNORECASE,
+        )
+        if m_trail:
+            prefix_content = last_content[:m_trail.start()].strip()
+            early_marks, early_exp = _parse_marks_from_text(prefix_content, 0.0)
+            if early_exp or re.search(r"total", m_trail.group(0), re.IGNORECASE) or len(parsed) > 1:
+                parsed[-1] = (last_label, prefix_content)
+
+    return prefix, parsed, True
+
+
+def _extract_mcq_options(text: str) -> List[str]:
+    """Extract standard a-d MCQ choices without treating them as subparts."""
+    if not text:
+        return []
+    pattern = re.compile(
+        r"(?:^|\s)(?:\(([a-dA-D])\)|([a-dA-D])[.)])\s*"
+        r"(.*?)(?=\s*(?:\([a-dA-D]\)|[a-dA-D][.)])\s+|$)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    found = []
+    for m in pattern.finditer(text):
+        label = (m.group(1) or m.group(2)).upper()
+        value = re.sub(r"\s+", " ", m.group(3)).strip(" ;")
+        if value:
+            found.append(f"{label}) {value}")
+    # Only call these MCQ options when the labels are exactly a,b,c,d.
+    labels = [x.split(")", 1)[0] for x in found]
+    if labels == ["A", "B", "C", "D"]:
+        return found
+    return []
+
+
+def _clamp_children_marks_to_parent(
+    questions: List["ExtractedQuestion"],
+    parent_marks_map: Dict[str, Tuple[float, bool]],
+) -> None:
+    """Hard safety clamp: sum(children) must never exceed parent total.
+
+    Guarantees:
+    1. No child's max_marks exceeds parent_total (when len(children) > 1).
+    2. Any child that absorbed the parent total annotation is corrected to
+       (parent_total - sum(other_children)).
+    3. The sum of child marks is strictly capped to parent_total.
+    4. Never assigns 0 or negative marks to any child.
+    """
+    from collections import defaultdict
+    children_by_parent: Dict[str, List["ExtractedQuestion"]] = defaultdict(list)
+    for q in questions:
+        if q.parent_question_id:
+            children_by_parent[q.parent_question_id].append(q)
+
+    for parent, children in children_by_parent.items():
+        parent_total, parent_has = parent_marks_map.get(parent, (0.0, False))
+        if not parent_has or parent_total <= 0:
+            # Fallback: check if children know their parent_max_marks
+            for c in children:
+                if c.parent_max_marks is not None and c.parent_max_marks > 0:
+                    parent_total = float(c.parent_max_marks)
+                    parent_has = True
+                    break
+        if not parent_has or parent_total <= 0:
+            continue
+
+        if len(children) <= 1:
+            if children and children[0].max_marks > parent_total:
+                children[0].max_marks = parent_total
+            continue
+
+        # Step 1: Detect children whose individual marks >= parent_total
+        # These almost certainly absorbed the parent-level total annotation.
+        for c in children:
+            if c.max_marks >= parent_total:
+                other_sum = sum(other.max_marks for other in children if other is not c)
+                corrected = round(parent_total - other_sum, 2)
+                if corrected > 0:
+                    logger.warning(
+                        "[MARKS CLAMP] %s child %s (%.2f >= parent %.2f) corrected to %.2f (parent - others %.2f)",
+                        parent, c.question_id, c.max_marks, parent_total, corrected, other_sum,
+                    )
+                    c.max_marks = corrected
+                else:
+                    logger.warning(
+                        "[MARKS CLAMP] %s child %s (%.2f >= parent %.2f) other_sum=%.2f >= parent",
+                        parent, c.question_id, c.max_marks, parent_total, other_sum,
+                    )
+
+        # Step 2: Check total sum of children
+        child_sum = sum(c.max_marks for c in children)
+        if child_sum > parent_total + 0.01:
+            logger.warning(
+                "[MARKS CLAMP] %s child_sum=%.2f > parent_total=%.2f — reconciling",
+                parent, child_sum, parent_total,
+            )
+            # Try adjusting the last child first
+            other_sum = sum(c.max_marks for c in children[:-1])
+            corrected = round(parent_total - other_sum, 2)
+            if corrected > 0:
+                old = children[-1].max_marks
+                children[-1].max_marks = corrected
+                logger.info(
+                    "[MARKS CLAMP] %s last child %s: %.2f -> %.2f",
+                    parent, children[-1].question_id, old, corrected,
+                )
+            else:
+                # If subtracting from others yields <= 0, split equally and fix rounding on last child
+                equal = round(parent_total / len(children), 2)
+                for c in children:
+                    c.max_marks = equal
+                rem = round(parent_total - sum(c.max_marks for c in children), 2)
+                if rem != 0 and children:
+                    children[-1].max_marks = round(children[-1].max_marks + rem, 2)
+                logger.info(
+                    "[MARKS CLAMP] %s all children reset to equal distribution total=%.2f",
+                    parent, parent_total,
+                )
+
+        # Step 3: Hard guarantee — no child exceeds parent_total
+        for c in children:
+            if c.max_marks > parent_total:
+                c.max_marks = parent_total
+
+
+def build_question_tree(text: str, default_marks: float = DEFAULT_MAX_MARKS) -> List[ExtractedQuestion]:
+    """Build a production-safe list of evaluatable leaf questions.
+
+    Hard rules:
+      * normal words can never become subpart labels;
+      * real (a)/(b)/(c) or (i)/(ii)/(iii) parts become separate leaves;
+      * standard four-choice a-d questions remain a single MCQ;
+      * parents are containers only and are never evaluation leaves;
+      * explicit DB [[TYPE:...]] and [Marks: ...] metadata wins over heuristics.
+    """
+    if not text or not text.strip():
+        return []
+
+    main_blocks: Dict[str, List[str]] = {}
+    sub_blocks: Dict[str, List[str]] = {}
+    sub_parent: Dict[str, str] = {}
+    sub_explicit_marks: Dict[str, Tuple[float, bool]] = {}
+    main_explicit_marks: Dict[str, Tuple[float, bool]] = {}
+    main_explicit_types: Dict[str, str] = {}
+    sub_explicit_types: Dict[str, str] = {}
+    order: List[str] = []
+    current_main: Optional[str] = None
+    current_leaf: Optional[str] = None
+    saw_subparts: Set[str] = set()
+
+    def add_order(qid: str) -> None:
+        if qid not in order:
+            order.append(qid)
+
+    def add_main(qid: str, content: str) -> None:
+        nonlocal current_main, current_leaf
+        current_main = qid
+        current_leaf = qid
+        content = content.strip()
+        main_blocks.setdefault(qid, []).append(content)
+        pt_m = re.search(r"\[PARENT_TOTAL:\s*(\d+(?:\.\d+)?)\]", content, re.IGNORECASE)
+        if pt_m:
+            try:
+                main_explicit_marks[qid] = (float(pt_m.group(1)), True)
+            except (TypeError, ValueError):
+                pass
+        else:
+            marks, explicit_marks = _parse_marks_from_text(content, float(default_marks))
+            if explicit_marks:
+                main_explicit_marks[qid] = (marks, True)
+        clean, explicit_type = _extract_type_marker(content)
+        if explicit_type:
+            main_explicit_types[qid] = explicit_type
+        add_order(qid)
+
+    def add_sub(parent: str, label: str, content: str) -> None:
+        nonlocal current_leaf
+        qid = _sub_id(parent, label)
+        current_leaf = qid
+        saw_subparts.add(parent)
+        sub_parent[qid] = parent
+        content = content.strip()
+        sub_blocks.setdefault(qid, []).append(content)
+        marks, explicit_marks = _parse_marks_from_text(content, float(default_marks))
+        if explicit_marks:
+            sub_explicit_marks[qid] = (marks, True)
+        clean, explicit_type = _extract_type_marker(content)
+        if explicit_type:
+            sub_explicit_types[qid] = explicit_type
+        add_order(qid)
+
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        # Standalone parent total or marks annotation on its own line
+        m_pt = re.match(r"^\[PARENT_TOTAL:\s*(\d+(?:\.\d+)?)\]$", stripped, re.IGNORECASE)
+        if not m_pt:
+            m_pt = re.match(
+                r"^[\[\(]\s*(?:total\s*)?(?:marks?\s*[:=\-]?\s*)?(\d+(?:\.\d+)?)\s*(?:marks?|pts?|m)?\s*[\]\)]$",
+                stripped, re.IGNORECASE,
+            )
+        if not m_pt:
+            m_pt = re.match(r"^(?:total\s+)?marks?\s*[:=\-]\s*(\d+(?:\.\d+)?)$", stripped, re.IGNORECASE)
+        if m_pt and current_main and current_main in saw_subparts:
+            try:
+                val = float(m_pt.group(1))
+                main_explicit_marks[current_main] = (val, True)
+                logger.info("[PARENT TOTAL] Captured parent %s total = %.2f from standalone line %r", current_main, val, stripped)
+                continue
+            except (ValueError, TypeError):
+                pass
+
+        # Explicit hierarchical header: Q.10.a / Q.10.i / Q.10.1.
+        # \b after the label prevents "W" (from "What") or "S" (from "Simplify")
+        # from being treated as a subpart — the label must end at a word boundary.
+        m = re.match(
+            r"^(?:Question|Qn|Q|Ans|Answer|Expected\s+Answer)?\s*\.?\s*"
+            r"(\d+)\s*\.\s*([a-zA-Z]\b|[ivxlcdm]+\b|\d+)\s*[\.:)\-]?\s*(.*)$",
+            stripped, re.IGNORECASE,
+        )
+        if m:
+            parent = f"Q.{m.group(1)}"
+            qid = f"{parent}.{m.group(2).lower()}"
+            current_main = parent
+            current_leaf = qid
+            saw_subparts.add(parent)
+            sub_parent[qid] = parent
+            content = m.group(3).strip()
+            sub_blocks.setdefault(qid, []).append(content)
+            marks, explicit_marks = _parse_marks_from_text(content, float(default_marks))
+            if explicit_marks:
+                sub_explicit_marks[qid] = (marks, True)
+            clean, explicit_type = _extract_type_marker(content)
+            if explicit_type:
+                sub_explicit_types[qid] = explicit_type
+            add_order(qid)
+            continue
+
+        # Main question header. This also repairs malformed Q.1.write into Q.1.
+        header = _question_header_match(stripped)
+        if header:
+            qid, rest = header
+            if len(qid.split(".")) == 2:
+                prefix, parts, is_sub = _split_inline_subpart_line(rest, qid)
+                if is_sub:
+                    # Preserve a parent-level total such as "[4 marks]" that
+                    # appears at the end of the combined inline question.
+                    pm, pe = _parse_marks_from_text(rest, float(default_marks))
+                    add_main(qid, prefix)
+                    if pe:
+                        main_explicit_marks[qid] = (pm, True)
+                    for label, content in parts:
+                        add_sub(qid, label, content)
+                    continue
+                add_main(qid, rest)
+                continue
+
+            # Explicit hierarchical header already handled above; this branch is
+            # defensive and keeps the parser deterministic.
+            parent = _question_parent_id(qid)
+            if parent:
+                current_main = parent
+                current_leaf = qid
+                saw_subparts.add(parent)
+                sub_parent[qid] = parent
+                sub_blocks.setdefault(qid, []).append(rest)
+                add_order(qid)
+            continue
+
+        # Bare main question: 10) text / 10. text.
+        m = re.match(r"^(\d+)\s*[.)]\s*(.*)$", stripped)
+        if m:
+            qid = f"Q.{m.group(1)}"
+            prefix, parts, is_sub = _split_inline_subpart_line(m.group(2).strip(), qid)
+            if is_sub:
+                pm, pe = _parse_marks_from_text(m.group(2).strip(), float(default_marks))
+                add_main(qid, prefix)
+                if pe:
+                    main_explicit_marks[qid] = (pm, True)
+                for label, content in parts:
+                    add_sub(qid, label, content)
+            else:
+                add_main(qid, m.group(2).strip())
+            continue
+
+        # Separate-line subpart. Parenthesized markers are authoritative;
+        # unparenthesized one-letter prose is NOT considered a subpart.
+        m = re.match(r"^\s*(?:\(([a-zA-Z]|[ivxlcdm]+|\d+)\)|\[([a-zA-Z]|[ivxlcdm]+|\d+)\])\s+(.*)$", stripped, re.IGNORECASE)
+        if m and current_main:
+            label = m.group(1) or m.group(2) or ""
+            add_sub(current_main, label, m.group(3).strip())
+            continue
+
+        # Continuation text belongs to the current leaf; otherwise to the parent.
+        if current_leaf and current_leaf in sub_blocks:
+            sub_blocks[current_leaf].append(stripped)
+        elif current_main:
+            main_blocks.setdefault(current_main, []).append(stripped)
+
+    questions: List[ExtractedQuestion] = []
+
+    # Pre-resolve subpart marks per parent to properly allocate budgets
+    resolved_sub_marks: Dict[str, Tuple[float, bool]] = {}
+    from collections import defaultdict
+    children_by_parent_qids: Dict[str, List[str]] = defaultdict(list)
+    for qid in order:
+        if qid in sub_blocks:
+            parent = sub_parent[qid]
+            children_by_parent_qids[parent].append(qid)
+
+    for parent, ch_qids in children_by_parent_qids.items():
+        parent_total, parent_has = main_explicit_marks.get(parent, (0.0, False))
+
+        # Pass 1: Parse candidate marks for each child
+        raw_marks_map: Dict[str, Tuple[float, bool]] = {}
+        for cid in ch_qids:
+            marks, explicit = sub_explicit_marks.get(cid, (0.0, False))
+            if not explicit:
+                raw_text = " ".join(x for x in sub_blocks[cid] if x).strip()
+                cleaned_sub_text = re.sub(
+                    r"\s*\[PARENT_TOTAL:\s*\d+(?:\.\d+)?\]\s*$", "", raw_text, flags=re.IGNORECASE
+                )
+                cleaned_sub_text = re.sub(
+                    r"\s*[\[\(]\s*(?:total\s*)?(?:marks?\s*[:=\-]?\s*)?\d+(?:\.\d+)?\s*(?:marks?|pts?|m)?\s*[\]\)]\s*$",
+                    "", cleaned_sub_text, flags=re.IGNORECASE
+                ).strip()
+                marks, explicit = _parse_marks_from_text(cleaned_sub_text, float(default_marks))
+                if not explicit:
+                    marks, explicit = _parse_marks_from_text(raw_text, float(default_marks))
+
+            # Rule 2a: If child has explicit marks >= parent total (when multiple children exist),
+            # it almost certainly absorbed the parent's total annotation!
+            if parent_has and explicit and len(ch_qids) > 1 and marks >= parent_total:
+                logger.warning(
+                    "[MARKS FIX] %s marks=%.2f >= parent %s total=%.2f — likely picked up parent total; discarding child marks",
+                    cid, marks, parent, parent_total,
+                )
+                explicit = False
+                marks = 0.0
+
+            raw_marks_map[cid] = (marks, explicit)
+
+        # Pass 2: Allocate marks among children
+        if parent_has:
+            known_cids = [cid for cid in ch_qids if raw_marks_map[cid][1]]
+            unknown_cids = [cid for cid in ch_qids if not raw_marks_map[cid][1]]
+            known_sum = sum(raw_marks_map[cid][0] for cid in known_cids)
+            remaining = round(parent_total - known_sum, 2)
+
+            if len(unknown_cids) == 1:
+                # Exactly one child unknown: it gets the remaining budget!
+                last_cid = unknown_cids[0]
+                if remaining > 0:
+                    raw_marks_map[last_cid] = (remaining, True)
+                    logger.info(
+                        "[MARKS FIX] %s allocated remaining budget %.2f (parent %.2f - known %.2f)",
+                        last_cid, remaining, parent_total, known_sum,
+                    )
+                else:
+                    raw_marks_map[last_cid] = (round(parent_total / len(ch_qids), 2), False)
+            elif len(unknown_cids) > 1:
+                # Multiple unknown children: distribute remaining budget equally
+                share = round(max(remaining, 0.0) / len(unknown_cids), 2) if remaining > 0 else round(parent_total / len(ch_qids), 2)
+                for u_cid in unknown_cids:
+                    raw_marks_map[u_cid] = (share, False)
+                    logger.info(
+                        "[MARKS FIX] %s allocated equal share %.2f of remaining %.2f",
+                        u_cid, share, remaining,
+                    )
+
+            # Rule 2c: Never allow any child mark to exceed parent_total
+            for cid in ch_qids:
+                m_val, m_exp = raw_marks_map[cid]
+                if m_val > parent_total:
+                    raw_marks_map[cid] = (parent_total, m_exp)
+        else:
+            for cid in ch_qids:
+                m_val, m_exp = raw_marks_map[cid]
+                if not m_exp:
+                    raw_marks_map[cid] = (float(default_marks), False)
+
+        for cid in ch_qids:
+            resolved_sub_marks[cid] = raw_marks_map[cid]
+
+    # Build only leaves.
+    for qid in order:
+        if qid in sub_blocks:
+            raw_text = " ".join(x for x in sub_blocks[qid] if x).strip()
+            parent = sub_parent[qid]
+            parent_context = " ".join(main_blocks.get(parent, [])).strip()
+            parent_clean, parent_type = _extract_type_marker(parent_context)
+            raw_clean, part_type = _extract_type_marker(raw_text)
+            combined = f"{parent_clean} {raw_clean}".strip() if parent_clean else raw_clean
+            clean_text = _clean_question_text(combined)
+
+            marks, explicit = resolved_sub_marks.get(qid, (float(default_marks), False))
+            parent_total, parent_has = main_explicit_marks.get(parent, (0.0, False))
+
+            explicit_type = sub_explicit_types.get(qid) or part_type or main_explicit_types.get(parent) or parent_type
+            mcq_opts = _extract_mcq_options(raw_text)
+            if explicit_type in {x.value for x in QuestionType}:
+                q_type = QuestionType(explicit_type)
+            else:
+                q_type = detect_question_type(clean_text, mcq_opts)
+
+            questions.append(ExtractedQuestion(
+                question_id=qid,
+                question_text=clean_text,
+                parent_question_id=parent,
+                parent_max_marks=float(parent_total) if parent_has else None,
+                question_type=q_type,
+                max_marks=float(marks),
+                has_explicit_marks=bool(explicit),
+                mcq_options=mcq_opts,
+                has_formulas=bool(re.search(r"[=+\-*/^√]", raw_text)),
+                has_diagram_reference=bool(re.search(r"\b(diagram|figure|sketch|draw|circuit|flowchart|label)\b", raw_text, re.IGNORECASE)),
+                extraction_confidence=1.0 if explicit else 0.92,
+            ))
+        elif qid in main_blocks and qid not in saw_subparts:
+            raw_text = " ".join(x for x in main_blocks[qid] if x).strip()
+            marks, explicit = main_explicit_marks.get(qid, (float(default_marks), False))
+            clean_with_type, explicit_type = _extract_type_marker(raw_text)
+            clean_text = _clean_question_text(clean_with_type)
+            mcq_opts = _extract_mcq_options(raw_text)
+            q_type = (
+                QuestionType(explicit_type)
+                if explicit_type in {x.value for x in QuestionType}
+                else detect_question_type(clean_text, mcq_opts)
+            )
+            questions.append(ExtractedQuestion(
+                question_id=qid,
+                question_text=clean_text,
+                parent_question_id=None,
+                question_type=q_type,
+                max_marks=float(marks),
+                has_explicit_marks=bool(explicit),
+                mcq_options=mcq_opts,
+                has_formulas=bool(re.search(r"[=+\-*/^√]", raw_text)),
+                has_diagram_reference=bool(re.search(r"\b(diagram|figure|sketch|draw|circuit|flowchart|label)\b", raw_text, re.IGNORECASE)),
+                extraction_confidence=1.0 if explicit else 0.95,
+            ))
+
+    # Hard production invariant: a parent with children is a container only.
+    parent_ids = {q.parent_question_id for q in questions if q.parent_question_id}
+    if parent_ids:
+        questions = [q for q in questions if q.question_id not in parent_ids]
+
+    # ── POST-VALIDATION CLAMP: sum(children_marks) must not exceed parent_total ──
+    _clamp_children_marks_to_parent(questions, main_explicit_marks)
+
+    # Detect impossible/suspicious IDs before they reach mapping/evaluation.
+    suspicious = [q.question_id for q in questions if (lambda suffix: bool(re.fullmatch(r"[a-zA-Z]{2,}", suffix)) and not bool(re.fullmatch(r"[ivxlcdm]+", suffix, re.IGNORECASE)))(q.question_id.split(".")[-1])]
+    if suspicious:
+        raise ValueError(f"Question parser produced invalid subpart IDs: {suspicious}")
+
+    _validate_leaf_question_invariant(questions)
+    _log_question_tree(questions, "Agent 1")
+    return questions
 
 
 def detect_question_type(q_text: str, options: List[str]) -> QuestionType:
-    tl = q_text.lower()
-    if options or len(re.findall(r"\(?[a-dA-D]\)[\.\\s]", q_text)) >= 2:
+    """Classify the leaf after structural parsing; explicit DB type wins upstream."""
+    tl = (q_text or "").lower()
+    if options and len(options) == 4:
         return QuestionType.MCQ
-    if re.search(r"\b(state\s+true\s+or\s+false|true/false|t/f)\b", tl):
+    if re.search(r"\b(state\s+true\s+or\s+false|true/false|true\s+or\s+false|t/f)\b", tl):
         return QuestionType.TRUE_FALSE
+    if re.search(r"\bassertion\s*[-–]?\s*reason\b", tl):
+        return QuestionType.ASSERTION_REASON
     if re.search(r"_{3,}|\bfill\s+in\s+the\s+blank(s)?\b", tl):
         return QuestionType.FILL_IN_THE_BLANK
     if re.search(r"\b(diagram|figure|sketch|draw|circuit|flowchart|label)\b", tl):
         return QuestionType.DIAGRAM
-    if re.search(r"\b(calculate|compute|solve|find the value|evaluate|formula)\b", tl) or bool(
-        re.search(r"[\=\+\-\*\/\^\√]", q_text)
-    ):
-        return QuestionType.NUMERICAL
-    if re.search(r"\b(write a program|code|algorithm|function|class definition|java|python|cpp)\b", tl):
+    if re.search(r"\b(write\s+a\s+program|code|algorithm|function|class\s+definition|java|python|cpp)\b", tl):
         return QuestionType.CODE
-    if re.search(r"\b(explain in detail|discuss|describe comprehensively|long note)\b", tl):
+    if re.search(r"\b(compare|comparison|differentiate|distinguish|difference\s+between|versus|vs\.?)\b", tl):
+        return QuestionType.COMPARISON
+    if re.search(r"\b(match\s+the\s+following|match\s+the\s+columns|match\s+the\s+pairs)\b", tl):
+        return QuestionType.MATCH
+    if re.search(r"\b(calculate|compute|solve|slove|find|evaluate|simplify|formula|rounding)\b", tl) or bool(re.search(r"[=+\-*/^√]", q_text or "")):
+        return QuestionType.NUMERICAL
+    if re.search(r"\b(explain\s+in\s+detail|discuss|describe\s+comprehensively|long\s+note)\b", tl):
         return QuestionType.LONG_ANSWER
-    if re.search(r"\b(define|what is|name|list|state|short note|briefly)\b", tl):
+    if re.search(r"\b(define|what\s+is|name|list|state|short\s+note|briefly)\b", tl):
         return QuestionType.SHORT_ANSWER
     return QuestionType.SUBJECTIVE
 
+def _strip_html_text(value: Any) -> str:
+    """Convert DB questionHtml/optionsHtml into clean plain text."""
+    if value is None:
+        return ""
+    text = html.unescape(str(value))
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _db_type_to_marker(q_type: Any) -> str:
+    """Normalize a DB type into a parser-safe explicit type marker."""
+    t = str(q_type or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "mcq": "mcq",
+        "multiple_choice": "mcq",
+        "multiplechoice": "mcq",
+        "true_false": "true_false",
+        "truefalse": "true_false",
+        "t_f": "true_false",
+        "short_answer": "short_answer",
+        "shortanswer": "short_answer",
+        "long_answer": "long_answer",
+        "longanswer": "long_answer",
+        "numerical": "numerical",
+        "numeric": "numerical",
+        "subjective": "subjective",
+        "fill_in_the_blank": "fill_in_the_blank",
+        "fillintheblank": "fill_in_the_blank",
+        "diagram": "diagram",
+        "comparison": "comparison",
+        "assertion_reason": "assertion_reason",
+        "assertionreason": "assertion_reason",
+        "match_the_following": "match",
+        "match": "match",
+    }
+    return aliases.get(t, t or "")
+
+
+def _serialize_db_question(q: Dict[str, Any], fallback_id: int) -> List[str]:
+    """Flatten one DB question into parser-friendly hierarchical lines.
+
+    The DB format used by the user's exam editor stores parent questions in
+    `question` and real evaluatable leaves in `parts[]`.  We preserve every
+    part's ID, marks and type instead of collapsing parts into the parent text.
+    """
+    raw_qid = str(
+        q.get("questionNumber")
+        or q.get("number")
+        or q.get("serialNumber")
+        or q.get("questionNo")
+        or q.get("questionId")
+        or q.get("id")
+        or ""
+    ).strip()
+    # The supplied DB uses UUIDs for `id`. UUIDs are storage IDs, not exam
+    # question numbers, so use the stable paper order when no human number exists.
+    if (not re.search(r"\d", raw_qid) or re.fullmatch(r"[0-9a-f]{20,}", raw_qid, re.IGNORECASE) or re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]{20,}", raw_qid, re.IGNORECASE)):
+        raw_qid = str(fallback_id)
+    qid = _normalize_qid(raw_qid) if not raw_qid.startswith("Q.") else raw_qid
+
+    parts = q.get("parts") or []
+    if parts:
+        # In the supplied DB, `question` contains the entire combined sentence
+        # including (a)/(b)/(c), while `questionHtml` contains the true parent
+        # instruction such as "Slove" or "Calculate:". Use the latter so every
+        # leaf receives only its own subquestion plus the shared instruction.
+        parent_text = (
+            _strip_html_text(q.get("questionHtml"))
+            or q.get("question")
+            or q.get("text")
+            or ""
+        )
+    else:
+        parent_text = (
+            q.get("question")
+            or _strip_html_text(q.get("questionHtml"))
+            or q.get("text")
+            or ""
+        )
+    parent_text = _strip_html_text(parent_text)
+    parent_marks = q.get("marks")
+    parent_type = _db_type_to_marker(q.get("type"))
+
+    lines: List[str] = []
+    parent_line = f"{qid}) {parent_text}".strip()
+    if parent_marks is not None:
+        if q.get("parts"):
+            parent_line += f" [PARENT_TOTAL: {parent_marks}]"
+        else:
+            parent_line += f" [Marks: {parent_marks}]"
+    if parent_type:
+        parent_line += f" [[TYPE:{parent_type}]]"
+    lines.append(parent_line)
+
+    if isinstance(parts, list):
+        for index, part in enumerate(parts):
+            if not isinstance(part, dict):
+                continue
+            raw_part_id = str(part.get("questionId") or part.get("id") or "").strip()
+            # DB part IDs are UUIDs, so use their position when no human label is
+            # available.  The parent question's partNumbering tells us whether to
+            # emit a/b/c or i/ii/iii.
+            numbering = str(q.get("partNumbering") or "alpha").lower()
+            if numbering.startswith("roman"):
+                labels = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"]
+            else:
+                labels = list("abcdefghijklmnopqrstuvwxyz")
+            label = labels[index] if index < len(labels) else str(index + 1)
+
+            # If the DB already contains a human sub-label in the text, preserve it.
+            part_text = (
+                part.get("question")
+                or _strip_html_text(part.get("questionHtml"))
+                or part.get("text")
+                or ""
+            )
+            part_text = _strip_html_text(part_text)
+            explicit_label = re.match(r"^\s*[\(\[]?([a-zA-Zivxlcdm]+)[\)\].:]\s+", part_text, re.IGNORECASE)
+            if explicit_label:
+                label = explicit_label.group(1).lower()
+                part_text = re.sub(r"^\s*[\(\[]?[a-zA-Zivxlcdm]+[\)\].:]\s+", "", part_text, count=1).strip()
+
+            part_qid = f"{qid}.{label}"
+            marks = part.get("marks")
+            part_type = _db_type_to_marker(part.get("type")) or parent_type
+            line = f"({label}) {part_text}".strip()
+            if marks is not None:
+                line += f" [Marks: {marks}]"
+            if part_type:
+                line += f" [[TYPE:{part_type}]]"
+
+            # Preserve MCQ options from the DB without letting A)/B)/C)/D) be
+            # mistaken for subquestion boundaries by the parser.
+            options = part.get("options") or []
+            if isinstance(options, list) and options:
+                for oi, option in enumerate(options):
+                    if option is None:
+                        continue
+                    letter = chr(ord("A") + oi)
+                    option_text = _strip_html_text(option)
+                    if option_text:
+                        line += f" OPTION {letter}: {option_text}"
+
+            lines.append(line)
+    return lines
+
 
 def detect_and_parse_input(raw_input: str) -> str:
-    """Universal Input Manager: accepts Text, JSON, or stringified JSON."""
+    """Universal input manager with lossless support for the exam DB structure.
+
+    IMPORTANT: Never collapse `parts[]` into the parent question. Each DB part is
+    emitted as a separate hierarchical parser line so Q.19.a/Q.19.b/Q.19.c can
+    become separate evaluation leaves.
+    """
     if not raw_input or not raw_input.strip():
         return ""
     stripped = raw_input.strip()
@@ -793,136 +1672,63 @@ def detect_and_parse_input(raw_input: str) -> str:
             if isinstance(data, list):
                 q_list = data
             elif isinstance(data, dict):
-                for s in data.get("sections") or []:
-                    if isinstance(s, dict):
-                        sec_name = s.get("name") or s.get("title") or ""
+                for section in data.get("sections") or []:
+                    if isinstance(section, dict):
+                        sec_name = section.get("name") or section.get("title") or ""
                         if sec_name:
-                            lines.append(f"\n--- {sec_name} ---")
-                        q_list.extend(s.get("questions") or [])
+                            lines.append(f"--- {sec_name} ---")
+                        q_list.extend(section.get("questions") or [])
                 if not q_list:
                     q_list = data.get("questions") or []
                 if data.get("title"):
                     lines.insert(0, f"Title: {data['title']}")
-            idx = 1
-            for q in q_list:
+
+            emitted = 0
+            for idx, q in enumerate(q_list, start=1):
                 if isinstance(q, dict):
-                    q_id = q.get("questionId") or q.get("id") or str(idx)
-                    q_text = q.get("text") or q.get("question") or ""
-                    q_marks = q.get("marks")
-                    mark_str = f" [Marks: {q_marks}]" if q_marks is not None else ""
-                    lines.append(f"{q_id}. {q_text}{mark_str}")
-                    idx += 1
-            if lines and idx > 1:
+                    lines.extend(_serialize_db_question(q, idx))
+                    emitted += 1
+            if emitted:
                 return "\n".join(lines)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[Input] Structured JSON parse failed; using raw text: {e}")
     return stripped
 
 
-def build_question_tree(text: str, default_marks: float = DEFAULT_MAX_MARKS) -> List[ExtractedQuestion]:
-    """Parse question paper text into structured questions (deterministic, no LLM)."""
-    if not text or not text.strip():
-        return []
-
-    lines = text.split("\n")
-    text_buffer: Dict[str, List[str]] = {}
-    order: List[str] = []
-    current_q_id: Optional[str] = None
-
-    for raw_line in lines:
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-
-        matched = False
-
-        # Decimal sub-question 1.2
-        m = re.match(r"^(\d+)\.(\d+)[\.:\)]?\s+(.*)", stripped)
-        if m:
-            q_id = f"Q.{m.group(1)}.{m.group(2)}"
-            text_buffer.setdefault(q_id, [])
-            if q_id not in order:
-                order.append(q_id)
-            text_buffer[q_id].append(m.group(3).strip())
-            current_q_id = q_id
-            matched = True
-
-        # Alpha sub-question 4(a)
-        if not matched:
-            m = re.match(r"^(\d+)\s*\(([a-zA-Z])\)[\.:]?\s+(.*)", stripped)
-            if m:
-                q_id = f"Q.{m.group(1)}{m.group(2).lower()}"
-                text_buffer.setdefault(q_id, [])
-                if q_id not in order:
-                    order.append(q_id)
-                text_buffer[q_id].append(m.group(3).strip())
-                current_q_id = q_id
-                matched = True
-
-        # Main question 3. or 3)
-        if not matched:
-            m = re.match(r"^(\d+)[\.)\s]\s*(.*)", stripped)
-            if m:
-                q_id = f"Q.{m.group(1)}"
-                text_buffer.setdefault(q_id, [])
-                if q_id not in order:
-                    order.append(q_id)
-                text_buffer[q_id].append(m.group(2).strip())
-                current_q_id = q_id
-                matched = True
-
-        # Hex/UUID question ID
-        if not matched:
-            m = re.match(r"^(?:---|\s*)\s*\[?([a-fA-F0-9]{12,36}|[a-fA-F0-9-]{32,36})\]?[\.:\)]?\s+(.*)", stripped)
-            if m:
-                content = re.sub(r"^[a-fA-F0-9]{12,36}[\.:\)]?\s*", "", m.group(2).strip()).strip()
-                q_id = f"Q.{len(order) + 1}"
-                text_buffer.setdefault(q_id, [])
-                if q_id not in order:
-                    order.append(q_id)
-                text_buffer[q_id].append(content)
-                current_q_id = q_id
-                matched = True
-
-        # Continuation
-        if not matched and current_q_id and current_q_id in text_buffer:
-            if not re.match(r"^(?:---|\s*)\s*\[?[a-fA-F0-9]{12,36}\]?", stripped):
-                text_buffer[current_q_id].append(stripped)
-
-    questions: List[ExtractedQuestion] = []
-    for q_id in order:
-        full_text = " ".join(text_buffer[q_id]).strip()
-        clean_text = re.sub(
-            r"\s*(?:\[|\()\s*(?:Marks?\s*:\s*)?\d+\.?\d*\s*(?:marks?|pts?|m)?\s*(?:\]|\))", "",
-            full_text, flags=re.IGNORECASE,
-        ).strip()
-        marks, has_explicit = _parse_marks_from_text(full_text, float(default_marks))
-        mcq_opts = [
-            f"{o.group(1).upper()}) {o.group(2).strip()}"
-            for o in re.finditer(r"(?:^|\n)\s*\(?([a-dA-D])\)\.?\s*(.*?)(?=\n\s*\(?[a-dA-D][\.\)]|\Z)", full_text, re.DOTALL)
-        ]
-        q_type = detect_question_type(full_text, mcq_opts)
-        questions.append(ExtractedQuestion(
-            question_id=q_id,
-            question_text=clean_text,
-            question_type=q_type,
-            max_marks=marks,
-            has_explicit_marks=has_explicit,
-            mcq_options=mcq_opts,
-            has_formulas=bool(re.search(r"[\=\+\-\*\/\^\√]", full_text)),
-            has_diagram_reference=bool(re.search(r"\b(diagram|figure|sketch|draw)\b", full_text, re.IGNORECASE)),
-            extraction_confidence=1.0,
-        ))
-    return questions
-
-
 def parse_model_answers(answer_key_text: str, questions: Optional[List[ExtractedQuestion]] = None) -> Dict[str, str]:
-    """Parse model answer key text into question_id → answer_text map (deterministic)."""
+    """Parse model answers while preserving hierarchical IDs such as Q.10.i."""
     if not answer_key_text or not answer_key_text.strip():
         return {}
 
+    valid_ids = [q.question_id for q in (questions or [])]
+    valid_set = set(valid_ids)
+
+    def canonical(ref: str) -> Optional[str]:
+        s = str(ref or "").strip()
+        if not s:
+            return None
+        if s in valid_set:
+            return s
+        s2 = re.sub(r"^[Qq]\s*\.?\s*", "", s)
+        s2 = re.sub(r"[()\[\]]", "", s2)
+        s2 = re.sub(r"\s*\.\s*", ".", s2).strip(" .:)-")
+        candidate = f"Q.{s2}"
+        if candidate in valid_set:
+            return candidate
+        # Hierarchical numbering can differ between paper and answer key:
+        # Q.19.a == Q.19.i when both denote the first child.
+        parts = s2.split(".")
+        if len(parts) >= 2:
+            parent = f"Q.{parts[0]}"
+            label = ".".join(parts[1:])
+            mapped = _canonical_student_sub_id(parent, label, valid_set)
+            if mapped:
+                return mapped
+        # Never collapse a hierarchical reference such as 19.i to parent Q.19.
+        return None
+
+
     stripped = answer_key_text.strip()
-    # Try JSON first
     if stripped.startswith("{") or stripped.startswith("["):
         try:
             data = json.loads(stripped)
@@ -932,85 +1738,117 @@ def parse_model_answers(answer_key_text: str, questions: Optional[List[Extracted
                 q_list = data
             elif isinstance(data, dict):
                 q_list = data.get("answers") or data.get("questions") or []
-                for s in data.get("sections") or []:
-                    if isinstance(s, dict):
-                        q_list.extend(s.get("questions") or [])
-            for item in q_list:
-                if isinstance(item, dict):
-                    q_id = str(item.get("questionId") or item.get("id") or "")
-                    ans = str(item.get("answer") or item.get("expectedAnswer") or item.get("text") or "")
-                    if q_id and ans:
-                        key = q_id if q_id.startswith("Q") else f"Q.{q_id}"
+                for section in data.get("sections") or []:
+                    if isinstance(section, dict):
+                        q_list.extend(section.get("questions") or [])
+            def walk_answer_item(item: Any, inherited_parent: Optional[str] = None) -> None:
+                if not isinstance(item, dict):
+                    return
+                ref = item.get("questionId") or item.get("question_id") or item.get("number") or item.get("id")
+                # UUIDs are storage IDs; if a nested part has no human number, its
+                # parent question's parts can still be matched by array position.
+                answer_value = item.get("answer") or item.get("expectedAnswer") or item.get("modelAnswer")
+                if answer_value is not None and ref:
+                    key = canonical(str(ref))
+                    ans = str(answer_value).strip()
+                    if key and ans:
                         answers[key] = ans
+                nested = item.get("parts") or item.get("subquestions") or item.get("children") or []
+                if isinstance(nested, list):
+                    for child in nested:
+                        walk_answer_item(child, canonical(str(ref)) if ref else inherited_parent)
+
+            for item in q_list:
+                walk_answer_item(item)
             if answers:
                 return answers
         except Exception:
             pass
 
-    # Text-based parsing
     text = normalize_ocr_text(answer_key_text)
-    lines = text.split("\n")
+    raw_lines = text.splitlines()
+    lines: List[str] = []
+
+    # Answer keys are often emitted as one paragraph:
+    # `19. (a) ... [1] ; (b) ... [1] ; (c) ... [2]`.
+    # Split that paragraph into the same hierarchical leaves used by the question parser.
+    for raw_line in raw_lines:
+        stripped_line = raw_line.strip()
+        main_match = re.match(r"^(?:Question\s*)?(?:Q\.?)?\s*(\d+)[.):]\s*(.*)$", stripped_line, re.IGNORECASE)
+        if not main_match:
+            lines.append(raw_line)
+            continue
+        parent = f"Q.{main_match.group(1)}"
+        rest = main_match.group(2).strip()
+        marker_matches = list(re.finditer(r"(?:(?<=\s)|^)(\([a-zA-Zivxlcdm]+\)|[a-zA-Zivxlcdm]+[.)])\s+", rest, re.IGNORECASE))
+        valid_markers = []
+        for mm in marker_matches:
+            label = re.sub(r"[^a-zA-Z0-9]", "", mm.group(1)).lower()
+            canonical_id = _canonical_student_sub_id(parent, label, valid_set)
+            if canonical_id:
+                valid_markers.append((mm.start(), mm.end(), canonical_id))
+        if len(valid_markers) >= 1:
+            lines.append(f"{main_match.group(1)})")
+            for idx, (st, en, canonical_id) in enumerate(valid_markers):
+                stop = valid_markers[idx + 1][0] if idx + 1 < len(valid_markers) else len(rest)
+                label = canonical_id.split(".")[-1]
+                content = rest[en:stop].strip(" ;")
+                lines.append(f"({label}) {content}")
+        else:
+            lines.append(raw_line)
+
     answers: Dict[str, str] = {}
     current_q_id: Optional[str] = None
-    current_q_seq: int = 0
+    current_parent: Optional[str] = None
 
-    has_hex = bool(re.search(r"^(?:---|\s*)\s*\[?[a-fA-F0-9]{12,36}\]?", text, re.MULTILINE))
-    known_q_nums: Set[int] = set()
-    if questions:
-        for q in questions:
-            num_m = re.search(r"\d+", q.question_id)
-            if num_m:
-                known_q_nums.add(int(num_m.group()))
-
-    for line in lines:
-        sl = line.strip()
+    for raw_line in lines:
+        sl = raw_line.strip()
         if not sl:
             continue
 
-        # Hex ID
-        m_hex = re.match(r"^(?:---|\s*)\s*\[?([a-fA-F0-9]{12,36}|[a-fA-F0-9-]{32,36})\]?[\.:\)]?\s*(.*)", sl)
-        if m_hex:
-            current_q_seq += 1
-            clean = re.sub(r"^(?:Expected\s+Answer|Answer)\s*:\s*", "", m_hex.group(2), flags=re.IGNORECASE).strip()
-            answers[f"Q.{current_q_seq}"] = clean
-            answers[f"Q{current_q_seq}"] = clean
-            answers[str(current_q_seq)] = clean
-            current_q_id = f"Q.{current_q_seq}"
+        # Explicit hierarchical header: Q.10.i / 10.i / Q10.i
+        m = re.match(r"^(?:Question|Qn|Q|Ans|Answer|Expected\s+Answer)?\s*\.?\s*(\d+)\s*[.]\s*([a-zA-Z]+|\d+)\s*[.:)]?\s*(.*)$", sl, re.IGNORECASE)
+        if m:
+            candidate = f"Q.{m.group(1)}.{m.group(2).lower()}"
+            key = canonical(candidate)
+            if key:
+                current_q_id = key
+                current_parent = f"Q.{m.group(1)}"
+                content = re.sub(r"^(?:Expected\s+Answer|Answer)\s*[:\-]?\s*", "", m.group(3), flags=re.IGNORECASE).strip()
+                answers.setdefault(key, content)
+                continue
+
+        # Main question header: 10) / Q.10) / Answer 10:
+        m = re.match(r"^(?:Question|Qn|Q|Ans|Answer|Expected\s+Answer)?\s*\.?\s*(\d+)\s*[.:)]\s*(.*)$", sl, re.IGNORECASE)
+        if m:
+            parent = f"Q.{m.group(1)}"
+            current_parent = parent
+            content = re.sub(r"^(?:Expected\s+Answer|Answer)\s*[:\-]?\s*", "", m.group(2), flags=re.IGNORECASE).strip()
+            # If the parsed question list contains a parent-only question, use it.
+            if parent in valid_set:
+                current_q_id = parent
+                answers.setdefault(parent, content)
+            else:
+                current_q_id = None
             continue
 
-        m_num = re.match(r"^(\d+)[\.)\s]\s*(.*)", sl)
-        if m_num:
-            num_val = int(m_num.group(1))
-            content = m_num.group(2)
-            has_prefix = bool(re.match(r"^(?:Expected\s+Answer|Answer|Question|Qn|Q\d+)\s*:\s*", content, re.IGNORECASE))
+        # Roman/alpha subpart line after a main question header.
+        m = re.match(r"^[\(\[]?([ivxlcdm]+|[a-zA-Z]|\d+)[\)\].:]\s+(.*)$", sl, re.IGNORECASE)
+        if m and current_parent:
+            candidate = _sub_id(current_parent, m.group(1))
+            key = canonical(candidate)
+            if key:
+                current_q_id = key
+                answers[key] = m.group(2).strip()
+                continue
 
-            if has_hex:
-                is_new = False
-            elif has_prefix:
-                is_new = True
-            elif current_q_seq == 0:
-                is_new = True
-            elif num_val <= current_q_seq:
-                is_new = False
-            elif known_q_nums:
-                is_new = (num_val in known_q_nums) and (num_val == current_q_seq + 1 or not current_q_id)
-            else:
-                is_new = (num_val == current_q_seq + 1)
-
-            if is_new:
-                current_q_seq = num_val
-                current_q_id = f"Q.{num_val}"
-                clean = re.sub(r"^(?:Expected\s+Answer|Answer)\s*:\s*", "", content, flags=re.IGNORECASE).strip()
-                answers[current_q_id] = clean
-                answers[f"Q{num_val}"] = clean
-                answers[str(num_val)] = clean
-            elif current_q_id:
-                answers[current_q_id] = (answers.get(current_q_id, "") + "\n" + sl).strip()
-        elif current_q_id:
+        if current_q_id:
             answers[current_q_id] = (answers.get(current_q_id, "") + "\n" + sl).strip()
 
-    if not answers and text.strip():
-        answers["Q.1"] = text.strip()
+    # Sequential fallback is only safe for a flat question list. Never use it to
+    # map a subquestion to its parent.
+    if not answers and text.strip() and len(valid_ids) == 1:
+        answers[valid_ids[0]] = text.strip()
     return answers
 
 
@@ -1324,46 +2162,169 @@ def classify_line(line: str) -> Tuple[str, Optional[str]]:
     return "CONTENT", None
 
 
-def _generate_ocr_blocks(student_text: str) -> List[OCRBlock]:
+def _subpart_ordinal(label: str) -> Optional[int]:
+    """Convert a/b/c and i/ii/iii and 1/2/3 to the same ordinal."""
+    s = str(label or "").strip().lower().strip("()[] .:)")
+    if s.isdigit():
+        return int(s)
+    if re.fullmatch(r"[ivxlcdm]+", s, re.IGNORECASE):
+        return _roman_to_int(s)
+    if re.fullmatch(r"[a-z]", s, re.IGNORECASE):
+        return ord(s) - ord("a") + 1
+    return None
+
+
+def _canonical_student_sub_id(parent: str, label: str, known_question_ids: Set[str]) -> Optional[str]:
+    """Map a student's a/b/c or i/ii/iii label to the paper's child ID."""
+    direct = _sub_id(parent, label)
+    if direct in known_question_ids:
+        return direct
+
+    raw = str(label or "").strip().lower().strip("()[] .:)")
+    wanted_ordinals: List[int] = []
+    if raw.isdigit():
+        wanted_ordinals.append(int(raw))
+    elif re.fullmatch(r"[ivxlcdm]+", raw, re.IGNORECASE):
+        # A single Roman letter is ambiguous with alphabetic numbering (e.g. i).
+        # Try both interpretations; the available paper child IDs decide which is right.
+        roman_no = _roman_to_int(raw)
+        if roman_no is not None:
+            wanted_ordinals.append(roman_no)
+        if len(raw) == 1:
+            wanted_ordinals.append(ord(raw) - ord("a") + 1)
+    elif re.fullmatch(r"[a-z]", raw, re.IGNORECASE):
+        wanted_ordinals.append(ord(raw) - ord("a") + 1)
+
+    children: List[Tuple[int, str]] = []
+    prefix = parent + "."
+    for qid in known_question_ids:
+        if not qid.startswith(prefix):
+            continue
+        suffix = qid[len(prefix):].lower()
+        if suffix.isdigit():
+            ord_no = int(suffix)
+        elif re.fullmatch(r"[a-z]", suffix):
+            ord_no = ord(suffix) - ord("a") + 1
+        elif re.fullmatch(r"[ivxlcdm]+", suffix, re.IGNORECASE):
+            ord_no = _roman_to_int(suffix)
+        else:
+            ord_no = None
+        if ord_no is not None:
+            children.append((ord_no, qid))
+
+    for wanted in wanted_ordinals:
+        for ord_no, qid in sorted(children):
+            if ord_no == wanted:
+                return qid
+    return None
+
+
+def _generate_ocr_blocks(student_text: str, known_question_ids: Optional[Set[str]] = None) -> List[OCRBlock]:
     """
-    Generate answer blocks from student OCR text using context-aware classification.
+    Generate student answer blocks with hierarchical IDs.
+
+    Example:
+        10) Solve the following
+        i) answer one
+        ii) answer two
+
+    becomes:
+        Q.10.i -> first answer block
+        Q.10.ii -> second answer block
+
+    The parent Q.10 header is retained as context for the first subpart instead
+    of becoming an incorrectly evaluated 2-mark answer by itself.
     """
     if not student_text or not student_text.strip():
         return []
 
-    lines = student_text.split("\n")
+    known_question_ids = known_question_ids or set()
+    lines = student_text.splitlines()
     blocks: List[OCRBlock] = []
     current_lines: List[str] = []
     current_start = 0
     current_q_id: Optional[str] = None
-    block_id = 0
-
-    # Collect all explicit question headers present in the document
-    explicit_headers_set: Set[str] = set()
-    for line in lines:
-        l_type, q_tag = classify_line(line)
-        if l_type == "QUESTION_HEADER" and q_tag:
-            explicit_headers_set.add(q_tag)
-
+    current_parent: Optional[str] = None
     current_is_explicit = False
-    in_sublist = False
-    last_sublist_num = 0
+    block_id = 0
+    header_only = False
+    used_children_by_parent: Dict[str, Set[str]] = {}
 
-    def flush():
-        nonlocal block_id
-        if current_lines:
-            raw = "\n".join(current_lines).strip()
-            if raw:
-                blocks.append(OCRBlock(
-                    block_id=block_id, raw_text=raw,
-                    start_line=current_start,
-                    end_line=current_start + len(current_lines) - 1,
-                    detected_q_id=current_q_id,
-                    line_count=len(current_lines),
-                    word_count=len(raw.split()),
-                    is_explicit_header=current_is_explicit,
-                ))
-                block_id += 1
+    def _choose_subpart_id(parent: str, raw_label: str) -> str:
+        known_children = [qid for qid in known_question_ids if qid.startswith(parent + ".")]
+        used = used_children_by_parent.setdefault(parent, set())
+        direct = _canonical_student_sub_id(parent, raw_label, known_question_ids)
+        if direct and direct not in used:
+            used.add(direct)
+            return direct
+        children = []
+        for qid in known_children:
+            suffix = qid[len(parent)+1:]
+            ordinal = _subpart_ordinal(suffix)
+            if ordinal is not None:
+                children.append((ordinal, qid))
+        for _, qid in sorted(children):
+            if qid not in used:
+                used.add(qid)
+                logger.warning("[SUBPART DEBUG] Duplicate/ambiguous student label %r under %s -> %s", raw_label, parent, qid)
+                return qid
+        logger.warning("[SUBPART DEBUG] No unused child remains for student label %r under %s; leaving block unmapped", raw_label, parent)
+        return ""
+
+    def _split_inline_subparts(raw_line: str) -> List[str]:
+        """Split `19. (i) ... (ii) ...` only when the labels are real DB leaves.
+
+        This avoids confusing MCQ options such as `(a) ... (b) ...` with
+        subquestions when the parent has no corresponding child IDs.
+        """
+        text = raw_line.strip()
+        main = re.match(r"^(?:Question\s*)?(?:Q\.?)?\s*(\d+)[.):]\s*(.*)$", text, re.IGNORECASE)
+        if not main:
+            return [raw_line]
+        parent = f"Q.{main.group(1)}"
+        rest = main.group(2).strip()
+        matches = list(re.finditer(r"(?:(?<=\s)|^)(\([a-zA-Zivxlcdm]+\)|[a-zA-Zivxlcdm]+[.)])\s+", rest, re.IGNORECASE))
+        valid = []
+        for m in matches:
+            label = re.sub(r"[^a-zA-Z0-9]", "", m.group(1)).lower()
+            canonical = _choose_subpart_id(parent, label)
+            if canonical:
+                valid.append((m.start(), m.end(), label, canonical))
+        if not valid:
+            return [raw_line]
+        out = [f"{main.group(1)}) {rest[:valid[0][0]].strip()}".rstrip()]
+        for i, (start, end, label, canonical) in enumerate(valid):
+            stop = valid[i + 1][0] if i + 1 < len(valid) else len(rest)
+            content = rest[end:stop].strip()
+            # Emit the paper's canonical label so candidate retrieval gets an
+            # exact hierarchical ID even when the student used Roman numbering.
+            canonical_label = canonical.split(".")[-1]
+            out.append(f"({canonical_label}) {content}".strip())
+        return [x for x in out if x.strip()]
+
+    expanded_lines: List[str] = []
+    for raw in lines:
+        expanded_lines.extend(_split_inline_subparts(raw))
+    lines = expanded_lines
+
+    def flush() -> None:
+        nonlocal block_id, current_lines
+        if not current_lines:
+            return
+        raw = "\n".join(current_lines).strip()
+        if raw:
+            blocks.append(OCRBlock(
+                block_id=block_id,
+                raw_text=raw,
+                start_line=current_start,
+                end_line=current_start + len(current_lines) - 1,
+                detected_q_id=current_q_id,
+                line_count=len(current_lines),
+                word_count=len(raw.split()),
+                is_explicit_header=current_is_explicit,
+            ))
+            block_id += 1
+        current_lines = []
 
     for line_num, line in enumerate(lines):
         stripped = line.strip()
@@ -1372,66 +2333,103 @@ def _generate_ocr_blocks(student_text: str) -> List[OCRBlock]:
                 current_lines.append("")
             continue
 
-        line_type, q_tag = classify_line(line)
-        should_flush = False
-        new_q_id = current_q_id
-
-        if line_type == "QUESTION_HEADER":
-            should_flush = True
-            new_q_id = q_tag
-            current_is_explicit = True
-            in_sublist = False
-            last_sublist_num = 0
-        elif line_type == "SECTION_HEADER":
-            should_flush = True
-            current_is_explicit = False
-            in_sublist = False
-            last_sublist_num = 0
-        elif line_type == "BARE_NUMBER":
-            if not explicit_headers_set:
-                m_val = re.search(r"\d+", q_tag)
-                num_val = int(m_val.group(0)) if m_val else 0
-                curr_q_num = 0
-                if current_q_id:
-                    m_curr = re.search(r"\d+", current_q_id)
-                    if m_curr:
-                        curr_q_num = int(m_curr.group(0))
-
-                if current_q_id is None:
-                    should_flush = True
-                    new_q_id = q_tag
-                    current_is_explicit = False
-                    in_sublist = False
-                    last_sublist_num = 0
-                elif num_val <= curr_q_num:
-                    in_sublist = True
-                    last_sublist_num = num_val
-                elif in_sublist and num_val == last_sublist_num + 1:
-                    last_sublist_num = num_val
-                else:
-                    should_flush = True
-                    new_q_id = q_tag
-                    current_is_explicit = False
-                    in_sublist = False
-                    last_sublist_num = 0
-            else:
-                pass
-
-        if should_flush:
+        # Section headers are hard boundaries.
+        if re.match(r"^[-=_]{3,}$", stripped) or re.match(r"^SECTION\s+[A-Z]", stripped, re.IGNORECASE):
             flush()
-            current_lines = [line]
+            current_q_id = None
+            current_parent = None
+            current_is_explicit = False
+            header_only = False
+            current_start = line_num + 1
+            continue
+
+        # Explicit/hierarchical question header.
+        header = _question_header_match(stripped)
+        if header:
+            qid, content = header
+            # A hierarchical header already identifies the leaf.
+            if len(qid.split(".")) >= 3:
+                flush()
+                current_q_id = qid
+                current_parent = ".".join(qid.split(".")[:2])
+                current_is_explicit = True
+                current_start = line_num
+                current_lines = [line]
+                header_only = not bool(content)
+                continue
+
+            # Main question header. Delay flushing it as an independent answer;
+            # if the next line is a subpart, that header becomes context for it.
+            flush()
+            current_q_id = qid
+            current_parent = qid
+            current_is_explicit = True
             current_start = line_num
-            current_q_id = new_q_id
-        else:
-            current_lines.append(line)
+            current_lines = [line]
+            header_only = True
+            continue
+
+        # Bare main number (10) / 10.
+        m_main = re.match(r"^(\d+)[.):]\s*(.*)$", stripped)
+        if m_main:
+            flush()
+            current_q_id = f"Q.{m_main.group(1)}"
+            current_parent = current_q_id
+            current_is_explicit = False
+            current_start = line_num
+            current_lines = [line]
+            header_only = True
+            continue
+
+        # Roman/alpha/numeric subpart.
+        m_sub = re.match(r"^[\(\[]?([ivxlcdm]+|[a-zA-Z]|\d+)[\)\].:]\s+(.*)$", stripped, re.IGNORECASE)
+        if m_sub and current_parent:
+            sub_qid = _choose_subpart_id(current_parent, m_sub.group(1))
+            if not sub_qid:
+                # Ambiguous/extra subpart: do not attach it to an existing leaf.
+                flush()
+                current_q_id = None
+                current_parent = None
+                current_is_explicit = False
+                header_only = False
+                continue
+            # If the current block consists only of the main header, reuse it as
+            # context for this first subpart. Otherwise start a new subpart block.
+            if header_only and current_lines:
+                current_q_id = sub_qid
+                current_lines.append(line)
+                current_is_explicit = True
+                header_only = False
+            else:
+                flush()
+                current_q_id = sub_qid
+                current_start = line_num
+                current_lines = [line]
+                current_is_explicit = True
+                header_only = False
+            continue
+
+        # Ordinary content continues the current answer block.
+        if not current_lines:
+            current_start = line_num
+        current_lines.append(line)
+        header_only = False
 
     flush()
 
+    logger.info("[SUBPART DEBUG] ===== STUDENT OCR BLOCKS =====")
+    for b in blocks:
+        logger.info("[SUBPART DEBUG] block=%s | qid=%s | explicit=%s | lines=%s-%s | text=%r", b.block_id, b.detected_q_id or "<unmapped>", b.is_explicit_header, b.start_line, b.end_line, b.raw_text[:SUBPART_LOG_MAX_TEXT])
+    logger.info("[SUBPART DEBUG] ===== END OCR BLOCKS =====")
+
     if not blocks and student_text.strip():
         blocks.append(OCRBlock(
-            block_id=0, raw_text=student_text.strip(),
-            start_line=0, end_line=len(lines) - 1,
-            line_count=len(lines), word_count=len(student_text.split()),
+            block_id=0,
+            raw_text=student_text.strip(),
+            start_line=0,
+            end_line=len(lines) - 1,
+            line_count=len(lines),
+            word_count=len(student_text.split()),
             is_explicit_header=False,
         ))
     return blocks
@@ -1467,61 +2465,55 @@ def candidate_retrieval(
     model_answers: Dict[str, str],
     student_script: str = "Latin",
 ) -> Tuple[Dict[str, str], Dict[str, float], Dict[str, Dict[str, float]]]:
-    """
-    Stage 1: Deterministic candidate retrieval using 7-signal scoring + DP alignment.
-    Returns: (aligned_texts, confidence_map, signal_map)
-    """
+    """Stage 1 deterministic retrieval with hierarchical-ID-aware matching."""
     nq, nb = len(questions), len(blocks)
     if nb == 0:
-        return {}, {q.question_id: 0.0 for q in questions}, {}
+        return {q.question_id: "" for q in questions}, {q.question_id: 0.0 for q in questions}, {}
 
-    def _extract_q_number(q_id: str) -> Optional[str]:
-        m = re.search(r"\d+", q_id)
-        return m.group(0) if m else None
+    def qid_signature(qid: str) -> Tuple[str, str]:
+        parts = qid.split(".")
+        if len(parts) >= 3:
+            return parts[1], ".".join(parts[2:]).lower()
+        return (parts[1] if len(parts) > 1 else qid, "")
 
     def compute_score(q: ExtractedQuestion, block: OCRBlock, qi: int) -> AlignmentScore:
         score = AlignmentScore(question_id=q.question_id, block_id=block.block_id)
-        q_num = _extract_q_number(q.question_id)
+        q_main, q_sub = qid_signature(q.question_id)
 
-        # 1. Number Match
         if block.detected_q_id:
-            b_num = _extract_q_number(block.detected_q_id)
-            if q_num and b_num and q_num == b_num:
-                if block.is_explicit_header:
-                    score.s_number = 1.0
-                    score.composite = 0.95  # Direct explicit question header match!
-                    return score
-                else:
-                    score.s_number = 0.6
-            elif q_num and b_num:
-                score.s_number = levenshtein_similarity(q_num, b_num) * 0.3
+            b_main, b_sub = qid_signature(block.detected_q_id)
+            if q.question_id == block.detected_q_id:
+                score.s_number = 1.0
+                score.composite = 1.0
+                return score
+            if q_main == b_main and q_sub and b_sub:
+                # Same parent but wrong subpart must NOT look like a strong match.
+                score.s_number = 0.05
+            elif q_main == b_main:
+                score.s_number = 0.55
+            else:
+                score.s_number = 0.0
 
-        # 2. Position
         expected_rel = qi / max(nq - 1, 1)
         actual_rel = block.block_id / max(nb - 1, 1)
         score.s_position = max(0.0, 1.0 - abs(expected_rel - actual_rel) * 2.0)
 
-        # 3. Semantic
         if len(block.raw_text.split()) >= 3:
             score.s_semantic = min(jaccard_ngram_similarity(q.question_text, block.raw_text, n=3) * 2.0, 1.0)
 
-        # 4. Layout
         bl = block.raw_text.split("\n")
         total_l = max(len(bl), 1)
-        struct = sum(1 for l in bl if re.match(r"^\s*[-•*]\s+", l) or re.match(r"^\s*\d+[\.)\]]\s+", l))
+        struct = sum(1 for l in bl if re.match(r"^\s*[-•*]\s+", l) or re.match(r"^\s*\d+[.)\]]\s+", l))
         score.s_layout = min(struct / total_l + 0.2, 1.0)
 
-        # 5. Keywords
-        model_ans = model_answers.get(q.question_id, "")
-        ref_kws = extract_concepts(f"{q.question_text} {model_ans}")
+        model_ans = _resolve_model_answer(q.question_id, model_answers)
+        ref_kws = extract_concepts(q.question_text)
         block_kws = extract_concepts(block.raw_text)
         score.s_keyword = len(ref_kws & block_kws) / len(ref_kws) if ref_kws else 0.5
 
-        # 6. Language
         block_script, _ = detect_script(block.raw_text)
         score.s_language = 1.0 if block_script == student_script or student_script == "Latin" else 0.5
 
-        # 7. Context
         expected_words = max(q.max_marks * 20, 10)
         ratio = block.word_count / expected_words
         score.s_context = 0.0 if ratio < 0.1 else (0.5 if ratio > 3.0 else min(ratio, 1.0))
@@ -1534,40 +2526,57 @@ def candidate_retrieval(
         )
         return score
 
-    # Build score matrix
     scores = [[compute_score(questions[qi], blocks[bi], qi) for bi in range(nb)] for qi in range(nq)]
 
-    # DP monotonic alignment
-    INF = -float("inf")
-    dp = [[INF] * nb for _ in range(nq)]
-    parent = [[-1] * nb for _ in range(nq)]
+    # Prefer exact hierarchical IDs before global DP. This prevents Q.10.i and
+    # Q.10.ii from competing for the same block.
+    exact_assignments: Dict[int, int] = {}
+    used_blocks: Set[int] = set()
+    for qi, q in enumerate(questions):
+        candidates = [
+            bi for bi, b in enumerate(blocks)
+            if bi not in used_blocks and b.detected_q_id == q.question_id
+        ]
+        if candidates:
+            bi = candidates[0]
+            exact_assignments[qi] = bi
+            used_blocks.add(bi)
 
-    for bi in range(nb):
-        dp[0][bi] = scores[0][bi].composite
+    remaining_q = [qi for qi in range(nq) if qi not in exact_assignments]
+    remaining_b = [bi for bi in range(nb) if bi not in used_blocks]
 
-    for qi in range(1, nq):
-        for bi in range(qi, nb):
-            best_prev, best_bi = INF, -1
-            for prev_bi in range(bi):
-                if dp[qi - 1][prev_bi] > best_prev:
-                    best_prev = dp[qi - 1][prev_bi]
-                    best_bi = prev_bi
-            if best_prev > INF:
-                dp[qi][bi] = best_prev + scores[qi][bi].composite
-                parent[qi][bi] = best_bi
-
-    # Traceback
-    assignments: Dict[int, int] = {}
-    if nq > 0 and nb > 0:
-        best_end = max(range(nb), key=lambda bi: dp[nq - 1][bi])
-        if dp[nq - 1][best_end] > INF:
-            cur = best_end
-            for qi in range(nq - 1, -1, -1):
-                assignments[qi] = cur
-                if qi > 0:
-                    cur = parent[qi][cur]
-                    if cur < 0:
-                        break
+    assignments = dict(exact_assignments)
+    if remaining_q and remaining_b:
+        rq = len(remaining_q)
+        rb = len(remaining_b)
+        neg_inf = -float("inf")
+        dp = [[neg_inf] * rb for _ in range(rq)]
+        parent = [[-1] * rb for _ in range(rq)]
+        for bj, bi in enumerate(remaining_b):
+            dp[0][bj] = scores[remaining_q[0]][bi].composite
+        for rqi in range(1, rq):
+            for bj in range(rqi, rb):
+                best_prev = neg_inf
+                best_idx = -1
+                for prev in range(bj):
+                    if dp[rqi - 1][prev] > best_prev:
+                        best_prev = dp[rqi - 1][prev]
+                        best_idx = prev
+                if best_idx >= 0:
+                    qi = remaining_q[rqi]
+                    bi = remaining_b[bj]
+                    dp[rqi][bj] = best_prev + scores[qi][bi].composite
+                    parent[rqi][bj] = best_idx
+        if rq and rb:
+            end_idx = max(range(rb), key=lambda j: dp[rq - 1][j])
+            if dp[rq - 1][end_idx] > neg_inf:
+                cur = end_idx
+                for rqi in range(rq - 1, -1, -1):
+                    assignments[remaining_q[rqi]] = remaining_b[cur]
+                    if rqi > 0:
+                        cur = parent[rqi][cur]
+                        if cur < 0:
+                            break
 
     aligned, conf_map, sig_map = {}, {}, {}
     for qi, q in enumerate(questions):
@@ -1577,15 +2586,43 @@ def candidate_retrieval(
             aligned[q.question_id] = blocks[bi].raw_text
             conf_map[q.question_id] = round(feat.composite, 3)
             sig_map[q.question_id] = {
-                "s_number": round(feat.s_number, 3), "s_position": round(feat.s_position, 3),
-                "s_semantic": round(feat.s_semantic, 3), "composite": round(feat.composite, 3),
+                "s_number": round(feat.s_number, 3),
+                "s_position": round(feat.s_position, 3),
+                "s_semantic": round(feat.s_semantic, 3),
+                "composite": round(feat.composite, 3),
             }
         else:
             aligned[q.question_id] = ""
             conf_map[q.question_id] = 0.0
             sig_map[q.question_id] = {"composite": 0.0}
-
     return aligned, conf_map, sig_map
+
+
+
+def _source_support_score(answer_text: str, source_text: str) -> float:
+    if not answer_text or not source_text:
+        return 0.0
+    a = re.sub(r"\s+", " ", answer_text.lower()).strip()
+    s = re.sub(r"\s+", " ", source_text.lower()).strip()
+    if a and a in s:
+        return 1.0
+    tokens = re.findall(r"[a-z]{2,}|\d+(?:[.,]\d+)*|[₹$%]|[+\-*/=]", a)
+    if not tokens:
+        return 0.0
+    sn = re.sub(r"\s+", "", s)
+    return sum(1 for t in tokens if re.sub(r"\s+", "", t) in sn) / max(len(tokens), 1)
+
+
+def _validate_mapped_answer(
+    q: ExtractedQuestion,
+    answer_text: str,
+    source_block: Optional[OCRBlock],
+) -> Tuple[bool, str]:
+    if not answer_text or not answer_text.strip():
+        return False, "empty_answer"
+    if source_block and source_block.detected_q_id and source_block.detected_q_id != q.question_id:
+        return False, f"wrong_leaf:{source_block.detected_q_id}"
+    return True, "ok"
 
 
 def hybrid_answer_mapping(
@@ -1596,169 +2633,225 @@ def hybrid_answer_mapping(
     student_ocr_conf: float = 1.0,
     student_page_images: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, float], Dict[str, Dict[str, float]], Dict[str, int]]:
-    """
-    Hybrid Answer Mapping:
-        Stage 1:  Deterministic candidate retrieval (7-signal DP) — ~2ms
-        Stage 2:  VL adjudication for LOW confidence matches
-        Stage 2b: LLM search of the student text for unmapped questions
-        Stage 3:  FALLBACK — whole-sheet reading when OCR confidence is low or
-                  mapping failed for most questions (see whole_sheet_fallback_mapping)
-    """
-    # Stage 1: Candidate Retrieval
-    blocks = _generate_ocr_blocks(student_ocr_text)
-    aligned, conf_map, sig_map = candidate_retrieval(questions, blocks, model_answers, student_script)
+    """Production answer mapping with strict leaf ownership and conservative fallbacks."""
+    student_page_images = student_page_images or []
+    known_ids = {q.question_id for q in questions}
 
-    # Page mapping
-    page_map: Dict[str, int] = {}
-    for q_id, ans_text in aligned.items():
-        page_map[q_id] = _detect_page_for_block(student_ocr_text, ans_text) if ans_text else -1
+    blocks = _generate_ocr_blocks(student_ocr_text, known_ids)
+    aligned, conf_map, sig_map = candidate_retrieval(
+        questions, blocks, model_answers, student_script
+    )
+    page_map = {
+        qid: _detect_page_for_block(student_ocr_text, ans) if ans else -1
+        for qid, ans in aligned.items()
+    }
+    block_by_id = {b.block_id: b for b in blocks}
 
-    # Stage 2: VL Adjudication for low-confidence matches
-    low_conf_ids = [q.question_id for q in questions
-                    if conf_map.get(q.question_id, 0) < HIGH_CONFIDENCE_THRESHOLD
-                    and aligned.get(q.question_id, "").strip()]
+    # Reject deterministic assignments that clearly belong to another leaf.
+    for q in questions:
+        ans = aligned.get(q.question_id, "")
+        if not ans:
+            continue
+        source = next((b for b in blocks if b.raw_text.strip() == ans.strip()), None)
+        ok, reason = _validate_mapped_answer(q, ans, source)
+        if not ok:
+            logger.warning("[Mapping Guard] %s rejected: %s", q.question_id, reason)
+            aligned[q.question_id] = ""
+            conf_map[q.question_id] = 0.0
+            sig_map[q.question_id] = {"composite": 0.0, "rejected": True}
 
-    if low_conf_ids and student_ocr_text.strip():
-        for q_id in low_conf_ids:
-            q = next((q for q in questions if q.question_id == q_id), None)
-            if not q:
+    # Stage 2: ownership adjudication only. No expected answer is supplied.
+    low_ids = [
+        q.question_id for q in questions
+        if aligned.get(q.question_id, "").strip()
+        and conf_map.get(q.question_id, 0.0) < HIGH_CONFIDENCE_THRESHOLD
+    ]
+    for qid in low_ids:
+        q = next((x for x in questions if x.question_id == qid), None)
+        if not q:
+            continue
+        candidate = aligned.get(qid, "").strip()
+        prompt = f"""You are a STUDENT-ANSWER BLOCK OWNERSHIP CLASSIFIER.
+
+TARGET LEAF: {qid}
+PARENT: {q.parent_question_id or "<none>"}
+SUBPART: {_question_subpart_label(qid) or "<root>"}
+QUESTION:
+{q.question_text[:700]}
+
+UNTRUSTED OCR BLOCK:
+{wrap_untrusted_student_text(candidate[:1200])}
+
+Decide ONLY whether this block is the student's response to this exact leaf.
+Do not solve, grade, complete, or compare against any expected answer.
+Reject sibling answers and question/options text.
+
+Return ONLY JSON:
+{{"is_match":true/false,"confidence":0.0-1.0,"reasoning":"brief"}}"""
+        try:
+            raw = generate_with_vl(prompt, max_new_tokens=220)
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not m:
                 continue
-            student_ans = aligned.get(q_id, "")
-            if not student_ans.strip():
+            data = json.loads(m.group(0))
+            conf = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
+            if bool(data.get("is_match", False)) and conf >= LOW_CONFIDENCE_THRESHOLD:
+                conf_map[qid] = max(conf_map.get(qid, 0.0), round(conf, 3))
+                sig_map[qid] = {**sig_map.get(qid, {}), "vl_adjudicated": conf}
+            else:
+                aligned[qid] = ""
+                conf_map[qid] = 0.0
+                sig_map[qid] = {"composite": 0.0, "vl_rejected": True}
+        except Exception as e:
+            logger.warning("[Stage 2: VL Ownership] %s failed: %s", qid, e)
+
+    # Stage 2b: leaf-specific retrieval. Expected answers are intentionally absent.
+    unmapped_ids = [q.question_id for q in questions if not aligned.get(q.question_id, "").strip()]
+    for qid in unmapped_ids:
+        q = next((x for x in questions if x.question_id == qid), None)
+        if not q:
+            continue
+
+        candidates = [
+            b for b in blocks
+            if b.detected_q_id == qid
+            or (q.parent_question_id and b.detected_q_id in (None, q.parent_question_id))
+        ]
+        candidates = candidates[:10]
+
+        exact = next((b for b in candidates if b.detected_q_id == qid), None)
+        if exact:
+            answer = exact.raw_text.strip()
+            answer = re.sub(r"^(?:Question|Qn|Q)\s*\.?\s*\d+(?:\.[a-zA-Z0-9]+)?[.):]?\s*", "", answer, flags=re.IGNORECASE)
+            answer = re.sub(r"^\s*[\(\[]?[a-zA-Zivxlcdm0-9]+[\)\].:]\s*", "", answer, count=1).strip()
+            if answer:
+                aligned[qid] = answer
+                conf_map[qid] = 0.92
+                sig_map[qid] = {"composite": 0.92, "stage2b_exact_leaf": 1.0, "source_block_id": exact.block_id}
+                page_map[qid] = _detect_page_for_block(student_ocr_text, answer)
+                logger.info("[Stage 2b] %s EXACT block=%s answer=%r", qid, exact.block_id, answer[:SUBPART_LOG_MAX_TEXT])
                 continue
 
+        if not candidates:
+            logger.info("[Stage 2b] %s no candidate blocks", qid)
+            continue
+
+        candidate_text = "\n\n".join(
+            f"[BLOCK {b.block_id} | detected_q={b.detected_q_id or 'none'} | lines={b.start_line}-{b.end_line}]\n{b.raw_text[:1000]}"
+            for b in candidates
+        )
+        prompt = f"""You are a STRICT STUDENT-ANSWER LOCATOR.
+
+TARGET LEAF ID: {qid}
+PARENT: {q.parent_question_id or "<none>"}
+SUBPART: {_question_subpart_label(qid) or "<root>"}
+QUESTION:
+{q.question_text[:800]}
+
+CANDIDATE OCR BLOCKS:
+{wrap_untrusted_student_text(candidate_text)}
+
+Find ONLY the student's actual response belonging to this exact leaf.
+Do NOT grade it. Do NOT solve it. Do NOT use an expected/model answer.
+Do NOT use a sibling subpart. Do NOT invent missing text.
+If it is absent, return found=false.
+
+Return ONLY JSON:
+{{"found":true/false,"answer_text":"exact copied text","source_block_id":null,"confidence":0.0-1.0,"reasoning":"brief"}}"""
+        try:
+            raw = generate_with_vl(prompt, max_new_tokens=500)
+            logger.info("[Stage 2b DEBUG] %s RAW=%s", qid, raw[:800])
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not m:
+                continue
+            data = json.loads(m.group(0))
+            found = bool(data.get("found", False))
+            answer = str(data.get("answer_text") or "").strip()
+            conf = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
             try:
-                prompt = f"""You are reading a handwritten student exam answer sheet. Determine if this text block is the student's answer to the given question.
+                source_id = int(data.get("source_block_id")) if data.get("source_block_id") is not None else None
+            except (TypeError, ValueError):
+                source_id = None
+            source = block_by_id.get(source_id) if source_id is not None else None
+            if source is None and answer:
+                source = next((b for b in candidates if answer.lower() in b.raw_text.lower()), None)
+            support = _source_support_score(answer, source.raw_text) if source else 0.0
+            owner_ok, owner_reason = _validate_mapped_answer(q, answer, source)
+            if found and answer and conf >= 0.70 and support >= 0.35 and owner_ok:
+                aligned[qid] = answer
+                conf_map[qid] = round(conf, 3)
+                sig_map[qid] = {
+                    "composite": round(conf, 3), "llm_fallback": True,
+                    "source_block_id": source.block_id if source else -1,
+                    "source_support": round(support, 3),
+                }
+                page_map[qid] = _detect_page_for_block(student_ocr_text, answer)
+                logger.info("[Stage 2b] %s FOUND block=%s conf=%.3f support=%.3f answer=%r",
+                            qid, source.block_id if source else -1, conf, support, answer[:SUBPART_LOG_MAX_TEXT])
+            else:
+                logger.info("[Stage 2b] %s REJECTED found=%s conf=%.3f support=%.3f owner=%s(%s)",
+                            qid, found, conf, support, owner_ok, owner_reason)
+        except Exception as e:
+            logger.warning("[Stage 2b] %s failed: %s", qid, e)
 
-Question ({q_id}): {q.question_text[:300]}
-Expected Answer: {model_answers.get(q_id, '')[:300]}
-
-Text Block from Student Sheet:
-{student_ans[:500]}
-
-Return ONLY valid JSON:
-{{"is_match": true/false, "confidence": 0.0-1.0, "reasoning": "brief explanation"}}"""
-
-                raw = generate_with_vl(prompt, max_new_tokens=200)
-                m = re.search(r"\{.*\}", raw, re.DOTALL)
-                if m:
-                    data = json.loads(m.group(0))
-                    vl_conf = float(data.get("confidence", 0.5))
-                    is_match = data.get("is_match", True)
-                    if is_match and vl_conf > conf_map.get(q_id, 0):
-                        conf_map[q_id] = round(vl_conf, 3)
-                        sig_map[q_id]["vl_adjudicated"] = vl_conf
-                    elif not is_match:
-                        aligned[q_id] = ""
-                        conf_map[q_id] = 0.0
-                        sig_map[q_id]["vl_rejected"] = True
-            except Exception as e:
-                logger.warning(f"[VL-Adjudicate] {q_id} failed: {e}")
-
-    # Stage 2b: LLM Fallback Retrieval for unmapped/empty questions
-    unmapped_ids = [q.question_id for q in questions
-                    if (conf_map.get(q.question_id, 0) < HIGH_CONFIDENCE_THRESHOLD
-                        and not aligned.get(q.question_id, "").strip())]
-
-    if unmapped_ids and student_ocr_text.strip():
-        logger.info(f"[Stage 2b: LLM Fallback] {len(unmapped_ids)} unmapped questions: {unmapped_ids}")
-        for q_id in unmapped_ids:
-            q = next((q for q in questions if q.question_id == q_id), None)
-            if not q:
-                continue
-
-            try:
-                # Truncate student text to fit context window reasonably
-                student_text_truncated = student_ocr_text[:3000]
-                model_ans = model_answers.get(q_id, '')[:400]
-
-                prompt = f"""You are an expert at reading student exam answer sheets. The automatic answer mapper failed to find the student's answer for the question below.
-
-Search through the FULL student answer sheet text and extract ONLY the text that is the student's answer to this specific question. The student may have written the answer without a clear question number header.
-
-Question ({q_id}): {q.question_text[:400]}
-Expected/Model Answer (for reference): {model_ans}
-
-=== FULL STUDENT ANSWER SHEET TEXT ===
-{student_text_truncated}
-=== END OF STUDENT TEXT ===
-
-Return ONLY valid JSON:
-{{"found": true/false, "answer_text": "the exact extracted student answer text", "confidence": 0.0-1.0, "reasoning": "brief explanation of how you identified this answer"}}
-
-If the student did not answer this question at all, return {{"found": false, "answer_text": "", "confidence": 0.0, "reasoning": "not found in student sheet"}}"""
-
-                raw = generate_with_vl(prompt, max_new_tokens=600)
-                m = re.search(r"\{.*\}", raw, re.DOTALL)
-                if m:
-                    data = json.loads(m.group(0))
-                    found = data.get("found", False)
-                    answer_text = data.get("answer_text", "").strip()
-                    vl_conf = float(data.get("confidence", 0.0))
-
-                    if found and answer_text and vl_conf >= 0.3:
-                        aligned[q_id] = answer_text
-                        conf_map[q_id] = round(vl_conf, 3)
-                        sig_map[q_id] = {"composite": round(vl_conf, 3), "llm_fallback": True}
-                        page_map[q_id] = _detect_page_for_block(student_ocr_text, answer_text)
-                        logger.info(f"[Stage 2b: LLM Fallback] {q_id}: FOUND (conf={vl_conf:.2f}, len={len(answer_text)})")
-                    else:
-                        logger.info(f"[Stage 2b: LLM Fallback] {q_id}: NOT FOUND (conf={vl_conf:.2f})")
-            except Exception as e:
-                logger.warning(f"[Stage 2b: LLM Fallback] {q_id} failed: {e}")
-
-    # Stage 3: Whole-sheet FALLBACK.
-    # Triggered when (a) the OCR text itself is unreliable, or (b) the stages above
-    # still left most questions unmapped. The VL model then reads the whole student
-    # sheet and maps every answer to its question, instead of trusting the OCR text.
+    # Stage 3: only a conservative visual fallback. Never map a reliable OCR
+    # document with no answer structure; false positives are worse than review.
     ocr_low = student_ocr_conf < OCR_FALLBACK_CONFIDENCE
     unmapped_now = [q.question_id for q in questions if not aligned.get(q.question_id, "").strip()]
     mapping_failed = bool(questions) and len(unmapped_now) / len(questions) >= MAPPING_FAILURE_RATIO
+    explicit_leaf_blocks = sum(1 for b in blocks if b.detected_q_id in known_ids and b.raw_text.strip())
 
-    if ocr_low or mapping_failed:
-        reads_images = bool(student_page_images)
-        if ocr_low and reads_images:
-            # OCR text is garbage → re-read EVERY question straight from the page images.
-            target_ids = [q.question_id for q in questions]
-        else:
-            # OCR is usable but mapping failed → only fill the gaps / weak matches.
-            target_ids = [q.question_id for q in questions
-                          if not aligned.get(q.question_id, "").strip()
-                          or conf_map.get(q.question_id, 0.0) < HIGH_CONFIDENCE_THRESHOLD]
-        logger.info(
-            f"[Stage 3: Whole-sheet] Fallback triggered (ocr_conf={student_ocr_conf:.2f}, "
-            f"unmapped={len(unmapped_now)}/{len(questions)}, source={'page images' if reads_images else 'OCR text'}) "
-            f"for {len(target_ids)} question(s)"
-        )
-        remapped = whole_sheet_fallback_mapping(
-            questions, student_ocr_text, student_page_images or [],
-            aligned, conf_map, sig_map, page_map, target_ids,
-            prefer_fallback=ocr_low and reads_images,
-        )
-        logger.info(f"[Stage 3: Whole-sheet] Re-mapped {remapped} question(s)")
+    invalid_document = (
+        bool(questions) and not ocr_low
+        and len(unmapped_now) / len(questions) >= 0.90
+        and explicit_leaf_blocks == 0
+    )
+    logger.info("[Stage 3 DEBUG] OCR=%.2f leaves=%d explicit_leaf_blocks=%d unmapped=%d/%d invalid_guard=%s",
+                student_ocr_conf, len(questions), explicit_leaf_blocks,
+                len(unmapped_now), len(questions), invalid_document)
 
-    # Fill unmapped
+    if invalid_document:
+        logger.warning("[Stage 3] SKIPPED: reliable OCR + no answer structure; leaving answers unmapped.")
+    elif (ocr_low or mapping_failed) and student_page_images:
+        target_ids = [q.question_id for q in questions if not aligned.get(q.question_id, "").strip()]
+        if target_ids:
+            remapped = whole_sheet_fallback_mapping(
+                questions, student_ocr_text, student_page_images,
+                aligned, conf_map, sig_map, page_map, target_ids,
+                prefer_fallback=ocr_low,
+            )
+            logger.info("[Stage 3] Conservative visual fallback remapped=%d", remapped)
+
     for q in questions:
-        if q.question_id not in aligned:
-            aligned[q.question_id] = ""
-            conf_map[q.question_id] = 0.0
-            sig_map[q.question_id] = {"composite": 0.0}
-            page_map[q.question_id] = -1
-
+        aligned.setdefault(q.question_id, "")
+        conf_map.setdefault(q.question_id, 0.0)
+        sig_map.setdefault(q.question_id, {"composite": 0.0})
+        page_map.setdefault(q.question_id, -1)
     return aligned, conf_map, sig_map, page_map
 
 
 def _normalize_question_ref(ref: Any, valid_ids: List[str]) -> Optional[str]:
-    """Match a question reference from the model ("Q.3", "Q3", "3", "4a") to a known question_id."""
+    """Resolve model references without collapsing Q.10.i into Q.10."""
     s = str(ref or "").strip()
-    if s in valid_ids:
-        return s
-    m = re.match(r"^[Qq]?\s*\.?\s*(\d+)(?:[.\s]*\(?([a-zA-Z]|\d+)\)?)?$", s)
-    if not m:
+    if not s:
         return None
-    num, sub = m.group(1), (m.group(2) or "").lower()
-    candidates = [f"Q.{num}{sub}", f"Q.{num}.{sub}", f"Q{num}{sub}", f"{num}{sub}"] if sub else [f"Q.{num}", f"Q{num}", num]
-    return next((c for c in candidates if c in valid_ids), None)
+    valid = set(valid_ids)
+    if s in valid:
+        return s
+    s2 = re.sub(r"^[Qq]\s*\.?\s*", "", s)
+    s2 = re.sub(r"[()\[\]]", "", s2)
+    s2 = re.sub(r"\s*\.\s*", ".", s2).strip(" .:)-")
+    if re.fullmatch(r"\d+(?:\.[a-zA-Z]+|\.\d+)?", s2):
+        candidates = [f"Q.{s2}"]
+        if "." in s2:
+            main, sub = s2.split(".", 1)
+            candidates += [f"Q.{main}.{sub.lower()}"]
+        else:
+            candidates += [f"Q{s2}"]
+        for c in candidates:
+            if c in valid:
+                return c
+    return None
 
 
 def _parse_fallback_answers(raw: str) -> List[Dict[str, Any]]:
@@ -1806,17 +2899,17 @@ def whole_sheet_fallback_mapping(
 
     valid_ids = [q.question_id for q in targets]
     question_list = "\n".join(f"- {q.question_id}: {q.question_text[:160]}" for q in targets)
-    reply_format = f"""Questions to look for:
+    reply_format = f"""LEAF QUESTIONS (IDs are authoritative):
 {question_list}
 
 Return ONLY valid JSON:
-{{"answers": [{{"question_id": "{valid_ids[0]}", "answer_text": "the exact answer written by the student", "confidence": 0.0-1.0}}]}}
-Include only questions whose answer appears here. Copy the student's words exactly — do not correct, complete or add to them."""
+{{"answers": [{{"question_id": "{valid_ids[0]}", "answer_text": "exact visible student answer", "confidence": 0.0-1.0, "question_id_visible": true/false}}]}}
+Rules: return ONLY answers visibly present in the supplied evidence; never solve or complete a question; never use another leaf's answer; never return an answer merely because it is expected. Set question_id_visible=true only when the target leaf ID is visibly present near that answer. If ownership is uncertain, return {{"answers": []}}."""
 
     # q_id → {"texts": [...parts in reading order], "conf": best confidence, "page": first page}
     found: Dict[str, Dict[str, Any]] = {}
 
-    def collect(items: List[Dict[str, Any]], page_no: int) -> None:
+    def collect(items: List[Dict[str, Any]], page_no: int, source_text: str = "") -> None:
         for item in items:
             q_id = _normalize_question_ref(item.get("question_id"), valid_ids)
             text = str(item.get("answer_text") or "").strip()
@@ -1824,29 +2917,45 @@ Include only questions whose answer appears here. Copy the student's words exact
                 conf = float(item.get("confidence", 0.0))
             except (TypeError, ValueError):
                 conf = 0.0
-            if not q_id or not text or conf < WHOLE_SHEET_MIN_CONFIDENCE:
+            if not q_id or not text or conf < max(WHOLE_SHEET_MIN_CONFIDENCE, 0.65):
                 continue
-            entry = found.setdefault(q_id, {"texts": [], "conf": 0.0, "page": page_no})
+            visible = bool(item.get("question_id_visible", False))
+            support = _source_support_score(text, source_text) if source_text else 0.0
+            if source_text and support < 0.25 and not visible:
+                logger.warning("[Stage 3] Reject %s page=%s: OCR support=%.2f and question_id_visible=false", q_id, page_no, support)
+                continue
+            entry = found.setdefault(q_id, {"texts": [], "conf": 0.0, "page": page_no, "support": 0.0})
             if text not in entry["texts"]:
                 entry["texts"].append(text)  # answer may continue across pages / windows
             entry["conf"] = max(entry["conf"], conf)
+            entry["support"] = max(entry.get("support", 0.0), support)
 
     if student_page_images:
         pages = student_page_images[:WHOLE_SHEET_MAX_PAGES]
+        logger.info(f"[Stage 3: DEBUG] Using PAGE IMAGES — {len(pages)} page(s): {pages}")
         for page_no, image_path in enumerate(pages, start=1):
             prompt = (
-                f"You are reading page {page_no} of {len(pages)} of a handwritten student exam answer sheet. "
-                f"Find the student's answers written on THIS page for the questions below. "
-                f"Answers may not have clear question numbers — use the content to decide which question they answer.\n\n"
+                f"You are a STRICT VISUAL STUDENT-ANSWER EXTRACTION SYSTEM. "
+                f"You are reading page {page_no} of {len(pages)}.\n\n"
+                "CRITICAL: The PAGE IMAGE is the ONLY evidence for student answers. "
+                "Do not solve any question. Do not infer answers. Do not use knowledge. "
+                "Do not invent an answer when the page is unrelated. "
+                "If an answer is not visibly written on this image, omit that question. "
+                "The question list only identifies which leaf IDs are allowed; it is NOT an answer source.\n\n"
                 + reply_format
             )
+            logger.info(f"[Stage 3: DEBUG] Page {page_no} — sending image to VL: {image_path}")
             try:
                 raw = generate_with_vl(prompt, image_paths=[image_path], max_new_tokens=900)
-                collect(_parse_fallback_answers(raw), page_no)
+                logger.info(f"[Stage 3: DEBUG] Page {page_no} — RAW VL response: {raw[:600]}")
+                parsed_items = _parse_fallback_answers(raw)
+                logger.info(f"[Stage 3: DEBUG] Page {page_no} — parsed {len(parsed_items)} answer(s): {parsed_items}")
+                collect(parsed_items, page_no, student_ocr_text)
             except Exception as e:
                 logger.warning(f"[Stage 3: Whole-sheet] Page {page_no} failed: {e}")
     elif student_ocr_text.strip():
         text = student_ocr_text
+        logger.info(f"[Stage 3: DEBUG] Using OCR TEXT — {len(text)} chars. First 300: {text[:300]!r}")
         overlap = WHOLE_SHEET_TEXT_WINDOW - WHOLE_SHEET_TEXT_STEP
         for start in range(0, max(len(text) - overlap, 1), WHOLE_SHEET_TEXT_STEP):
             chunk = text[start:start + WHOLE_SHEET_TEXT_WINDOW]
@@ -1858,48 +2967,57 @@ Include only questions whose answer appears here. Copy the student's words exact
             )
             try:
                 raw = generate_with_vl(prompt, max_new_tokens=900)
-                collect(_parse_fallback_answers(raw), _detect_page_for_block(text, chunk[:200]))
+                logger.info(f"[Stage 3: DEBUG] Text window {start} — RAW VL response: {raw[:600]}")
+                parsed_items = _parse_fallback_answers(raw)
+                logger.info(f"[Stage 3: DEBUG] Text window {start} — parsed {len(parsed_items)} answer(s): {parsed_items}")
+                collect(parsed_items, _detect_page_for_block(text, chunk[:200]), chunk)
             except Exception as e:
                 logger.warning(f"[Stage 3: Whole-sheet] Text window at {start} failed: {e}")
+
+    logger.info(f"[Stage 3: DEBUG] All found answers before remapping: { {k: {'preview': ' | '.join(v['texts'])[:100], 'conf': v['conf'], 'page': v['page']} for k, v in found.items()} }")
 
     remapped = 0
     for q_id, entry in found.items():
         new_text = "\n".join(entry["texts"]).strip()
         new_conf = round(entry["conf"], 3)
         current = aligned.get(q_id, "").strip()
-        if prefer_fallback or not current or new_conf > conf_map.get(q_id, 0.0):
+        if (not current or new_conf > conf_map.get(q_id, 0.0)) and new_conf >= 0.65:
             aligned[q_id] = new_text
             conf_map[q_id] = new_conf
             sig_map[q_id] = {**sig_map.get(q_id, {}), "composite": new_conf, "whole_sheet_fallback": True}
             if entry["page"] and entry["page"] > 0:
                 page_map[q_id] = entry["page"]
             remapped += 1
+            logger.info(f"[Stage 3: DEBUG] REMAPPED {q_id} — answer='{new_text[:80]}' conf={new_conf} page={entry['page']}")
 
     return remapped
 
 
 def _resolve_model_answer(q_id: str, model_answers: Dict[str, str]) -> str:
-    """Resolve model answer with multiple key format attempts."""
-    ans = model_answers.get(q_id, "")
-    if ans:
-        return ans
-    for alt in [q_id.replace("Q.", "Q"), q_id.replace("Q", "Q."), q_id.replace("Q.", "")]:
-        ans = model_answers.get(alt, "")
+    """Resolve model answer with exact hierarchical-ID priority only."""
+    if not q_id:
+        return ""
+    direct_keys = [
+        q_id,
+        q_id.replace("Q.", "Q", 1),
+        q_id.replace("Q.", "", 1),
+    ]
+    for key in direct_keys:
+        ans = model_answers.get(key, "")
         if ans:
             return ans
+
+    # If this is a subquestion, do NOT fall back to the parent or same-number
+    # answer. That was the source of answer-key leakage between Q.10.i/Q.10.ii.
+    if len(q_id.split(".")) >= 3:
+        return ""
+
     q_num = re.search(r"\d+", q_id)
     if q_num:
-        for key, val in model_answers.items():
-            key_num = re.search(r"\d+", key)
-            if key_num and key_num.group() == q_num.group():
-                return val
-    if model_answers:
-        q_num_m = re.search(r"\d+", q_id)
-        if q_num_m:
-            idx = int(q_num_m.group()) - 1
-            vals = list(model_answers.values())
-            if 0 <= idx < len(vals):
-                return vals[idx]
+        for key in (f"Q.{q_num.group()}", f"Q{q_num.group()}", q_num.group()):
+            ans = model_answers.get(key, "")
+            if ans:
+                return ans
     return ""
 
 
@@ -1946,6 +3064,7 @@ def _extract_text_rubric(model_answer: str, max_marks: float) -> List[Dict[str, 
 def evaluate_text_answer(evidence: EvidencePacket) -> TextEvalResult:
     """Evaluate text answer using Qwen2.5-VL-3B with non-destructive security."""
     result = TextEvalResult(max_marks=evidence.rubric.text_marks)
+    logger.info("[SUBPART DEBUG][EVAL START] qid=%s | parent=%s | subpart=%s | type=%s | max=%.2f | student=%r | expected=%r", evidence.question_id, evidence.parent_question_id or "<none>", evidence.subpart_label or "<root>", evidence.question_type.value, evidence.rubric.text_marks, evidence.student_answer[:SUBPART_LOG_MAX_TEXT], evidence.expected_answer[:SUBPART_LOG_MAX_TEXT])
 
     if evidence.rubric.text_marks <= 0:
         result.reasoning = "No text marks allocated (pure diagram question)."
@@ -1961,6 +3080,24 @@ def evaluate_text_answer(evidence: EvidencePacket) -> TextEvalResult:
     if not model_ans or not model_ans.strip():
         result.reasoning = "No reference answer provided."
         return result
+
+    # TRUE/FALSE fast path. Do not send binary objective questions through a
+    # subjective grading prompt.
+    if evidence.question_type == QuestionType.TRUE_FALSE:
+        def _tf_value(text: str) -> Optional[bool]:
+            m = re.search(r"\b(true|false|t|f)\b", text.strip(), re.IGNORECASE)
+            if not m:
+                return None
+            return m.group(1).lower() in {"true", "t"}
+        student_tf = _tf_value(student_ans)
+        model_tf = _tf_value(model_ans)
+        if student_tf is not None and model_tf is not None:
+            correct = student_tf == model_tf
+            result.score = evidence.rubric.text_marks if correct else 0.0
+            result.reasoning = f"True/False answer {'matches' if correct else 'does not match'} the reference."
+            result.feedback = "Correct." if correct else "The selected True/False value does not match the expected answer."
+            result.parse_confidence = 1.0
+            return result
 
     # MCQ / Option fast path (instant evaluation — 0ms, no LLM needed)
     # Require explicit bracketed options e.g. (a), (b), (c), (d) or labeled options in BOTH student & model answers
@@ -2018,10 +3155,15 @@ RUBRIC:
 {wrapped_answer}
 
 RULES:
-1. Empty/no answer → score=0
-2. Copy of question text → score=0
-3. Score ONLY the textual/conceptual component (max {evidence.rubric.text_marks} marks).
-4. Do NOT evaluate diagrams/figures — those are scored separately.
+1. Empty/no answer → score=0.
+2. Copy of question text → score=0.
+3. Score ONLY this exact leaf question/subpart: {evidence.question_id}.
+4. If this is a subpart, do NOT award marks for its parent or any sibling subpart.
+5. The maximum score is EXACTLY {evidence.rubric.text_marks} marks for this leaf.
+6. A correct answer to another subpart cannot earn marks here.
+7. Do NOT evaluate diagrams/figures — those are scored separately.
+8. Do NOT infer missing student work from the model answer.
+9. If the student answer is incomplete, award only marks supported by the work for THIS leaf.
 
 RESPOND ONLY WITH VALID JSON:
 {{
@@ -2055,6 +3197,7 @@ RESPOND ONLY WITH VALID JSON:
             result.keywords_matched = list(student_kws & model_kws)
             result.keywords_missing = list(model_kws - student_kws)[:5]
             result.concept_coverage_pct = calculate_concept_coverage(student_ans, model_ans)
+            logger.info("[SUBPART DEBUG][EVAL RESULT] qid=%s | parent=%s | subpart=%s | score=%.2f/%.2f | reason=%r | missing=%s", evidence.question_id, evidence.parent_question_id or "<none>", evidence.subpart_label or "<root>", result.score, result.max_marks, result.reasoning[:SUBPART_LOG_MAX_TEXT], result.missing_concepts)
             return result
 
         except Exception as e:
@@ -2208,6 +3351,8 @@ def aggregate_marks(evidence: EvidencePacket, text_result: TextEvalResult, visua
     if evidence.injection_flags:
         review_reasons.append(f"Prompt injection detected: {len(evidence.injection_flags)} flags")
 
+    logger.info("[SUBPART DEBUG][AGGREGATE] qid=%s | parent=%s | subpart=%s | text=%.2f/%.2f | visual=%.2f/%.2f | final=%.2f/%.2f | status=%s", evidence.question_id, evidence.parent_question_id or "<none>", evidence.subpart_label or "<root>", text_score, rubric.text_marks, visual_score, rubric.visual_marks, final_score, rubric.total_marks, status)
+
     return AggregatedResult(
         question_id=evidence.question_id,
         text_result=text_result,
@@ -2263,6 +3408,127 @@ class PipelineGraphState(TypedDict, total=False):
 
 # ── Agent 1: Exam Cache Loader (Deterministic — questions + answers from text) ──
 
+def _apply_answer_key_mark_allocations(
+    questions: List[ExtractedQuestion],
+    answer_key_text: str,
+) -> None:
+    """Override inferred child marks with explicit answer-key marks when present."""
+    if not answer_key_text:
+        return
+    children_by_parent: Dict[str, List[ExtractedQuestion]] = {}
+    for q in questions:
+        if q.parent_question_id:
+            children_by_parent.setdefault(q.parent_question_id, []).append(q)
+
+    for parent, children in children_by_parent.items():
+        num = re.search(r"\d+", parent)
+        if not num:
+            continue
+        n = num.group()
+        region_match = re.search(
+            rf"(?:^|\n)\s*(?:Q\.?\s*)?{re.escape(n)}\s*[.):\-]?\s*(.*?)(?=\n\s*(?:Q\.?\s*)?\d+\s*[.):\-]|\Z)",
+            answer_key_text, re.IGNORECASE | re.DOTALL
+        )
+        region = region_match.group(1) if region_match else answer_key_text
+        valid = {c.question_id for c in children}
+        markers = list(re.finditer(
+            r"(?:(?<=\s)|^)(\([a-zA-Zivxlcdm]+\)|[a-zA-Zivxlcdm]+[.)])\s+",
+            region, re.IGNORECASE
+        ))
+        found = {}
+        for i, m in enumerate(markers):
+            label = re.sub(r"[^a-zA-Z0-9]", "", m.group(1)).lower()
+            qid = _sub_id(parent, label)
+            if qid not in valid:
+                continue
+            stop = markers[i+1].start() if i+1 < len(markers) else len(region)
+            child_region = region[m.end():stop]
+            # ── Strip trailing parent-total annotations from the last child's region ──
+            # e.g. "18x + 86 [2]\n[4 marks]" → only parse "18x + 86 [2]"
+            if i + 1 >= len(markers):
+                child_region = re.sub(
+                    r"\s*\[PARENT_TOTAL:\s*\d+(?:\.\d+)?\]\s*$", "", child_region, flags=re.IGNORECASE
+                )
+                child_region = re.sub(
+                    r"\s*[\[\(]\s*(?:total\s*)?\d+(?:\.\d+)?\s*(?:marks?|pts?|m)?\s*[\]\)]\s*$",
+                    "", child_region, flags=re.IGNORECASE
+                ).strip()
+            marks, explicit = _parse_marks_from_text(child_region, 0.0)
+            if explicit:
+                found[qid] = marks
+
+        # Determine parent total: check children's parent_max_marks first, then answer key region
+        parent_total_val = None
+        for c in children:
+            if c.parent_max_marks is not None and c.parent_max_marks > 0:
+                parent_total_val = float(c.parent_max_marks)
+                break
+        if parent_total_val is None:
+            pt_m = re.search(r"\[PARENT_TOTAL:\s*(\d+(?:\.\d+)?)\]", region, re.IGNORECASE)
+            if not pt_m:
+                pt_m = re.search(
+                    r"[\[\(]\s*(?:total\s*)?(?:marks?\s*[:=\-]\s*)?(\d+(?:\.\d+)?)\s*(?:marks?|pts?|m)?\s*[\]\)]\s*$",
+                    region, re.IGNORECASE
+                )
+            if pt_m:
+                try:
+                    parent_total_val = float(pt_m.group(1))
+                except (ValueError, TypeError):
+                    pass
+
+        # If any single child found in answer key has marks >= parent_total_val (when len(children) > 1),
+        # it absorbed the parent total: discard it
+        if parent_total_val and len(children) > 1:
+            for qid, m_val in list(found.items()):
+                if m_val >= parent_total_val:
+                    logger.warning(
+                        "[MARKS FIX] %s answer-key child %s marks=%.2f >= parent total=%.2f — discarding",
+                        parent, qid, m_val, parent_total_val,
+                    )
+                    del found[qid]
+
+        # ── Validate sum(children) <= parent total before applying ──
+        if found:
+            child_sum = sum(found.get(c.question_id, c.max_marks) for c in children)
+            if parent_total_val and child_sum > parent_total_val:
+                logger.warning(
+                    "[MARKS FIX] %s answer-key child sum %.2f > parent total %.2f — "
+                    "redistributing last child",
+                    parent, child_sum, parent_total_val,
+                )
+                # The last child likely absorbed the parent total; recompute it
+                other_sum = sum(
+                    found.get(c.question_id, c.max_marks)
+                    for c in children[:-1]
+                )
+                last_child = children[-1]
+                corrected = round(parent_total_val - other_sum, 2)
+                if corrected > 0:
+                    found[last_child.question_id] = corrected
+                    logger.info(
+                        "[MARKS FIX] %s corrected to %.2f (parent_total %.2f - others %.2f)",
+                        last_child.question_id, corrected, parent_total_val, other_sum,
+                    )
+        for q in children:
+            if q.question_id in found:
+                old = q.max_marks
+                q.max_marks = float(found[q.question_id])
+                q.has_explicit_marks = True
+                logger.info("[MARKS DEBUG] %s answer-key marks=%.2f (was %.2f)", q.question_id, q.max_marks, old)
+        if found:
+            logger.info("[MARKS DEBUG] %s reconciled children=%s total=%.2f",
+                        parent, [(c.question_id, c.max_marks) for c in children],
+                        sum(c.max_marks for c in children))
+
+    # Finally run safety clamp across all questions to ensure invariant holds
+    parent_marks_dict = {
+        q.parent_question_id: (float(q.parent_max_marks), True)
+        for q in questions
+        if q.parent_question_id and q.parent_max_marks is not None and q.parent_max_marks > 0
+    }
+    _clamp_children_marks_to_parent(questions, parent_marks_dict)
+
+
 def exam_cache_loader_node(state: PipelineGraphState) -> Dict[str, Any]:
     """Agent 1: Parse question paper and answer key (deterministic — no LLM)."""
     metadata = state.get("metadata", PipelineMetadata())
@@ -2285,7 +3551,13 @@ def exam_cache_loader_node(state: PipelineGraphState) -> Dict[str, Any]:
             extraction_confidence=0.70,
         ))
 
+    _validate_leaf_question_invariant(questions)
     model_answers = parse_model_answers(clean_answers, questions)
+    _apply_answer_key_mark_allocations(questions, clean_answers)
+    logger.info("[SUBPART DEBUG] ===== MODEL ANSWERS BY LEAF =====")
+    for q in questions:
+        logger.info("[SUBPART DEBUG] model qid=%s | parent=%s | marks=%.2f | answer=%r", q.question_id, q.parent_question_id or "<none>", q.max_marks, model_answers.get(q.question_id, "")[:SUBPART_LOG_MAX_TEXT])
+    logger.info("[SUBPART DEBUG] ===== END MODEL ANSWERS =====")
 
     metadata.extraction_time_seconds = round(time.time() - t0, 3)
     metadata.questions_detected = len(questions)
@@ -2342,7 +3614,11 @@ def rubric_preprocessor_node(state: PipelineGraphState) -> Dict[str, Any]:
     metadata.rubric_time_seconds = round(time.time() - t0, 3)
     metadata.diagram_questions_count = sum(1 for r in rubric_allocations.values() if r.has_diagram)
 
-    logger.info(f"[Agent 3: Rubric] {len(rubric_allocations)} rubrics ({metadata.diagram_questions_count} diagram) in {metadata.rubric_time_seconds}s")
+    logger.info(f"[Agent 3: Rubric] {len(rubric_allocations)} LEAF rubrics ({metadata.diagram_questions_count} diagram) in {metadata.rubric_time_seconds}s")
+    for q in questions:
+        r = rubric_allocations.get(q.question_id)
+        if r:
+            logger.info("[SUBPART DEBUG][RUBRIC] qid=%s | parent=%s | marks=%.2f | text=%.2f | visual=%.2f | source=%s", q.question_id, q.parent_question_id or "<none>", r.total_marks, r.text_marks, r.visual_marks, r.allocation_source)
 
     return {"rubric_allocations": rubric_allocations, "metadata": metadata}
 
@@ -2372,6 +3648,10 @@ def hybrid_answer_mapper_node(state: PipelineGraphState) -> Dict[str, Any]:
     metadata.low_confidence_count = low
 
     logger.info(f"[Agent 4: Mapping] {high} high-conf, {low} low-conf in {metadata.mapping_time_seconds}s")
+    logger.info("[SUBPART DEBUG] ===== FINAL ANSWER MAPPING =====")
+    for q in questions:
+        logger.info("[SUBPART DEBUG] qid=%s | parent=%s | subpart=%s | conf=%.3f | answer=%r | page=%s", q.question_id, q.parent_question_id or "<none>", _question_subpart_label(q.question_id) or "<root>", confidence_map.get(q.question_id, 0.0), aligned_texts.get(q.question_id, "")[:SUBPART_LOG_MAX_TEXT], page_map.get(q.question_id, -1))
+    logger.info("[SUBPART DEBUG] ===== END FINAL ANSWER MAPPING =====")
 
     return {
         "aligned_texts": aligned_texts, "confidence_map": confidence_map,
@@ -2421,6 +3701,18 @@ def mapping_validator_node(state: PipelineGraphState) -> Dict[str, Any]:
             else:
                 seen[snippet] = q_id
 
+    # Parent/sibling invariant: every leaf must have an independent answer slot.
+    for q in questions:
+        if q.parent_question_id:
+            siblings = [
+                other for other in questions
+                if other.parent_question_id == q.parent_question_id
+                and other.question_id != q.question_id
+            ]
+            if aligned_texts.get(q.question_id, "").strip():
+                for sib in siblings:
+                    if aligned_texts.get(sib.question_id, "").strip() == aligned_texts[q.question_id].strip():
+                        warnings.append(f"{q.question_id}: Same student evidence mapped to sibling {sib.question_id}")
     metadata.injection_flags_count = injection_count
     logger.info(f"[Agent 5: Validation] {len(warnings)} warnings, {injection_count} injections")
 
@@ -2466,6 +3758,19 @@ def evidence_selector_node(state: PipelineGraphState) -> Dict[str, Any]:
             question_id=q_id, total_marks=q.max_marks,
             text_marks=q.max_marks, visual_marks=0.0,
         ))
+        # Defensive invariant: the rubric for a leaf question must never exceed
+        # the marks parsed for that exact question ID.
+        if rubric.total_marks != q.max_marks:
+            logger.warning(
+                f"[Agent 6: Evidence] Mark mismatch for {q_id}: "
+                f"parsed={q.max_marks}, rubric={rubric.total_marks}; rebuilding deterministic rubric"
+            )
+            rubric = RubricAllocation(
+                question_id=q_id, total_marks=q.max_marks,
+                text_marks=q.max_marks, visual_marks=0.0,
+                has_diagram=q.has_diagram_reference, allocation_confidence=1.0,
+                allocation_source="question_mark_invariant",
+            )
 
         # TARGETED page images — only for diagram questions
         student_imgs = []
@@ -2489,6 +3794,8 @@ def evidence_selector_node(state: PipelineGraphState) -> Dict[str, Any]:
             expected_answer=model_ans,
             student_answer=student_ans,
             rubric=rubric,
+            parent_question_id=q.parent_question_id,
+            subpart_label=_question_subpart_label(q_id),
             student_page_images=student_imgs,
             answer_key_page_images=ak_imgs,
             alignment_confidence=align_conf,
@@ -2497,9 +3804,11 @@ def evidence_selector_node(state: PipelineGraphState) -> Dict[str, Any]:
             injection_flags=inj_flags,
         ))
 
-    logger.info(f"[Agent 6: Evidence] {len(evidence_packets)} packets | "
-                f"Diagram images: {sum(1 for e in evidence_packets if e.student_page_images)} | "
-                f"Text-only: {sum(1 for e in evidence_packets if not e.student_page_images)}")
+    logger.info(f"[Agent 6: Evidence] {len(evidence_packets)} LEAF packets | Diagram images: {sum(1 for e in evidence_packets if e.student_page_images)} | Text-only: {sum(1 for e in evidence_packets if not e.student_page_images)}")
+    logger.info("[SUBPART DEBUG] ===== AGENT 6 EVIDENCE PACKETS =====")
+    for e in evidence_packets:
+        logger.info("[SUBPART DEBUG] qid=%s | parent=%s | subpart=%s | marks=%.2f | text_marks=%.2f | student=%r | expected=%r | alignment=%.3f | path=%s", e.question_id, e.parent_question_id or "<none>", e.subpart_label or "<root>", e.rubric.total_marks, e.rubric.text_marks, e.student_answer[:SUBPART_LOG_MAX_TEXT], e.expected_answer[:SUBPART_LOG_MAX_TEXT], e.alignment_confidence, e.alignment_path)
+    logger.info("[SUBPART DEBUG] ===== END AGENT 6 =====")
 
     return {"evidence_packets": evidence_packets, "metadata": metadata}
 
@@ -2521,7 +3830,7 @@ def parallel_evaluator_node(state: PipelineGraphState) -> Dict[str, Any]:
         text_res = evaluate_text_answer(ev)
         visual_res = evaluate_diagram(ev, cache_key=cache_key)
         agg = aggregate_marks(ev, text_res, visual_res)
-        logger.info(f"[Agent 7: Evaluator] {ev.question_id} evaluated in {round(time.time() - t_q, 2)}s: score={agg.final_score}/{agg.final_max_marks} ({agg.status})")
+        logger.info("[Agent 7: Evaluator] LEAF %s | parent=%s | subpart=%s | evaluated in %.2fs | score=%.2f/%.2f (%s)", ev.question_id, ev.parent_question_id or "<none>", ev.subpart_label or "<root>", time.time() - t_q, agg.final_score, agg.final_max_marks, agg.status)
         return agg
 
     # Controlled GPU concurrency
@@ -2548,6 +3857,14 @@ def score_aggregator_node(state: PipelineGraphState) -> Dict[str, Any]:
     total_score = sum(r.final_score for r in aggregated_results)
     max_possible = sum(r.final_max_marks for r in aggregated_results)
     pct = (total_score / max_possible * 100.0) if max_possible > 0 else 0.0
+
+    by_parent: Dict[str, List[AggregatedResult]] = {}
+    for r in aggregated_results:
+        parent = _question_parent_id(r.question_id)
+        if parent:
+            by_parent.setdefault(parent, []).append(r)
+    for parent, children in sorted(by_parent.items()):
+        logger.info("[SUBPART DEBUG][PARENT TOTAL] %s -> %s | score=%.2f/%.2f | children=%d", parent, [(x.question_id, x.final_score, x.final_max_marks) for x in children], sum(x.final_score for x in children), sum(x.final_max_marks for x in children), len(children))
 
     logger.info(f"[Agent 8: Aggregator] Total: {total_score:.1f}/{max_possible:.1f} ({pct:.1f}%)")
     return {}
@@ -2646,7 +3963,9 @@ def response_builder_node(state: PipelineGraphState) -> Dict[str, Any]:
         )
 
         question_items.append(QuestionItem(
-            questionId=f"Q{idx + 1}",
+            questionId=agg.question_id,
+            parentQuestionId=ev.parent_question_id,
+            subpartLabel=ev.subpart_label,
             questionText=ev.question_text,
             studentAnswer=ev.student_answer[:300],
             expectedAnswer=ev.expected_answer[:300],
@@ -2676,6 +3995,7 @@ def response_builder_node(state: PipelineGraphState) -> Dict[str, Any]:
             "rubric_cache_hits": metadata.rubric_cache_hits,
             "injection_flags": metadata.injection_flags_count,
             "eval_concurrency": MAX_EVAL_CONCURRENCY,
+            "hierarchical_question_ids": [e.question_id for e in evidence_packets],
         },
     )
 
@@ -2788,19 +4108,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_cors_origins = [
+    x.strip() for x in os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").split(",")
+    if x.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 
 @app.get("/health")
 async def health_check():
+    logger.info("[/health] Health check requested.")
     return {
         "status": "healthy",
         "service": f"AI Evaluation Pipeline v{PIPELINE_VERSION}",
-        "architecture": "v6.3 Enterprise Production — 9-Agent LangGraph",
+        "architecture": f"{PIPELINE_VERSION} — 9-Agent LangGraph",
         "model": VL_MODEL_VERSION,
         "model_strategy": "unified_vl_only",
         "agents": [
@@ -2818,6 +4145,7 @@ async def health_check():
             "max_pages": MULTI_PAGE_MAX,
             "max_questions": MAX_QUESTIONS_SUPPORTED,
             "eval_concurrency": MAX_EVAL_CONCURRENCY,
+            "hierarchical_question_ids": True,
             "rubric_caching": True,
             "visual_pre_evaluation": True,
             "targeted_page_cropping": True,
