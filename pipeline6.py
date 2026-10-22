@@ -3940,14 +3940,19 @@ def response_builder_node(state: PipelineGraphState) -> Dict[str, Any]:
 
         combined_missing = tr.missing_concepts or []
 
-        conf_reason = (
-            "Exact match." if agg.status == "Correct" else
-            "High semantic similarity." if agg.status == "Partial" else
-            "Low semantic match."
-        )
+        if agg.status == "Unanswered":
+            conf_score = 100.0
+            conf_reason = "No answer submitted."
+        else:
+            conf_score = round(ev.alignment_confidence, 2)
+            conf_reason = (
+                "Exact match." if agg.status == "Correct" else
+                "High semantic similarity." if agg.status == "Partial" else
+                "Low semantic match."
+            )
 
         q_eval = QuestionEvalDetail(
-            confidence=ConfidenceDetail(score=round(ev.alignment_confidence, 2), reason=conf_reason),
+            confidence=ConfidenceDetail(score=conf_score, reason=conf_reason),
             reasoning=ReasoningDetail(
                 analysis=combined_feedback,
                 comparison=AnswerComparison(student=ev.student_answer[:200], expected=ev.expected_answer[:200]),
