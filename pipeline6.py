@@ -926,19 +926,28 @@ def _sub_id(parent_id: str, sub: str) -> str:
     return f"{parent_id}.{sub}" if sub else parent_id
 
 
+# A sub-part label is digits, ONE letter (a/b/c) or a Roman numeral up to xxxix —
+# never a whole word. Previously any word was accepted, so "Q.1. Photosynthesis is..."
+# became question "Q.1.Photosynthesis" and the answer never matched Q.1.
+_SUBPART_LABEL = r"(?:\d+|x{0,3}(?:ix|iv|v?i{1,3}|v)|x{1,3}|[a-z])"
+# Attached directly ("Q.10.ii", "Q.1.a") or spaced but closed by ) . : ("Q.10. ii) ...").
+_SUBPART_SUFFIX = rf"(?:\s*\.(?:{_SUBPART_LABEL})(?![a-z0-9])|\s*\.\s+(?:{_SUBPART_LABEL})(?=\s*[.:)]))"
+
+
 def _question_header_match(line: str) -> Optional[Tuple[str, str]]:
     """Recognize main/explicit question headers, including hierarchical Q.10.i."""
     s = line.strip()
     patterns = [
-        r"^(?:Question|Qn|Q|प्रश्न|प्र|প্রশ্ন)\s*\.?\s*(\d+(?:\s*[.]\s*(?:[a-zA-Z]+|\d+))*)[\.:)\-]?\s*(.*)$",
-        r"^(?:Ans|Answer|उत्तर|উঃ|উত্তর)\s*[:.\-]?\s*(\d+(?:\s*[.]\s*(?:[a-zA-Z]+|\d+))*)[\.:)\-]?\s*(.*)$",
-        r"^(\d+)\s*[.]\s*([ivxlcdm]+|[a-zA-Z]|\d+)\s*[\.:)]\s*(.*)$",
+        rf"^(?:Question|Qn|Q|प्रश्न|प्र|প্রশ্ন)\s*\.?\s*(\d+(?:{_SUBPART_SUFFIX})*)[\.:)\-]?\s*(.*)$",
+        rf"^(?:Ans|Answer|उत्तर|উঃ|উত্তর)\s*[:.\-]?\s*(\d+(?:{_SUBPART_SUFFIX})*)[\.:)\-]?\s*(.*)$",
+        rf"^(\d+)\s*[.]\s*({_SUBPART_LABEL})\s*[\.:)]\s*(.*)$",
     ]
     for idx, pattern in enumerate(patterns):
         m = re.match(pattern, s, re.IGNORECASE)
         if m:
             if idx < 2:
                 qid = _normalize_qid(m.group(1))
+                qid = "Q." + qid[2:].lower()  # "Q.10.II" (OCR caps) must equal paper's "Q.10.ii"
                 return qid, m.group(2).strip()
             qid = f"Q.{m.group(1)}.{m.group(2).lower()}"
             return qid, m.group(3).strip()
@@ -3461,7 +3470,7 @@ def _log_run_report(final_state: Dict[str, Any], input_source: str, elapsed: flo
         peak_gb = torch.cuda.max_memory_allocated(0) / 1024 ** 3
         lines.append(f" VRAM     peak {peak_gb:.1f}GB of {_vl_runtime.get('vram_limit_gb', '?')}GB evaluator limit")
     lines.append("-" * 100)
-    lines.append(f" {'QUESTION':<12}{'MARKS':>11}  {'STATUS':<11}{'MAP CONF':>9}  {'MAPPED BY':<18}{'RUBRIC':<24}")
+    lines.append(f" {'QUESTION':<12}{'MARKS':>11}  {'STATUS':<11}{'MAP CONF':>9}  {'MAPPED BY':<24}RUBRIC")
 
     for q in questions:
         ev, agg = evidence.get(q.question_id), results.get(q.question_id)
@@ -3471,7 +3480,7 @@ def _log_run_report(final_state: Dict[str, Any], input_source: str, elapsed: flo
             mapped_by = ("whole_sheet" if signals.get("whole_sheet_fallback") else
                          "llm_fallback" if signals.get("llm_fallback") else ev.alignment_path)
             lines.append(f" {q.question_id:<12}{agg.final_score:>5.1f}/{agg.final_max_marks:<5.1f}  {agg.status:<11}"
-                         f"{ev.alignment_confidence:>9.2f}  {mapped_by:<18}"
+                         f"{ev.alignment_confidence:>9.2f}  {mapped_by:<24}"
                          f"{agg.rubric.allocation_source} t{agg.rubric.text_marks:g}+v{agg.rubric.visual_marks:g}")
         else:
             lines.append(f" {q.question_id:<12}{'-':>11}  NOT EVALUATED")
