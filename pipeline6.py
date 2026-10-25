@@ -122,10 +122,8 @@ WEIGHT_KEYWORD = 0.12
 WEIGHT_LANGUAGE = 0.08
 WEIGHT_CONTEXT = 0.06
 
-# ── Thread Lock & In-Memory Visual Pre-Evaluation Cache ──
+# ── Thread Lock (one GPU generation at a time) ──
 _vl_model_lock = threading.Lock()
-_cache_lock = threading.Lock()
-_visual_eval_cache: Dict[str, Dict[str, Any]] = {}
 
 # ── Singleton HTTP Client for OCR ──
 _ocr_client: Optional[httpx.AsyncClient] = None
@@ -187,10 +185,15 @@ USE_4BIT_QUANTIZATION = os.getenv("USE_4BIT_QUANTIZATION", "false").lower() == "
 # // Set MAX_EVAL_CONCURRENCY = 8 for 80GB VRAM / 24+ CPU Core enterprise servers to evaluate 8 questions in parallel!
 MAX_EVAL_CONCURRENCY = int(os.getenv("MAX_EVAL_CONCURRENCY", "8"))
 
-# // GPU precision: "auto" = bfloat16 where the GPU supports it, else float32.
-# // Set GPU_DTYPE=float32 to match CPU (local) results exactly (needs ~16GB free VRAM).
+# // GPU precision (accuracy first):
+# //   "float32"  = DEFAULT. Full precision, same as CPU, so server marks match local
+# //                marks. Needs ~16GB free VRAM; uses SDPA attention (FlashAttention-2
+# //                has no float32 kernels).
+# //   "bfloat16" = ~2x faster, half the VRAM, slightly less exact marks.
+# //   "auto"     = float32 when the GPU has >= 24GB VRAM, else bfloat16.
 # // float16 is never used — Qwen2.5-VL overflows in fp16 and produces garbage scores.
-GPU_DTYPE = os.getenv("GPU_DTYPE", "auto").lower()
+GPU_DTYPE = os.getenv("GPU_DTYPE", "float32").lower()
+FP32_MIN_VRAM_GB = 24
 
 
 def _resolve_gpu_dtype() -> torch.dtype:
@@ -198,8 +201,18 @@ def _resolve_gpu_dtype() -> torch.dtype:
         return torch.float32
     if GPU_DTYPE in ("bfloat16", "bf16"):
         return torch.bfloat16
-    # auto: older GPUs (T4, V100, P100) have no native bfloat16 → use float32
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    if vram_gb >= FP32_MIN_VRAM_GB or not torch.cuda.is_bf16_supported():
+        return torch.float32
+    return torch.bfloat16
+
+
+def _configure_gpu_precision(dtype: torch.dtype) -> None:
+    # TF32 silently rounds float32 matmuls/convs to ~10-bit mantissa on Ampere+;
+    # keep it off so float32 on GPU really matches float32 on CPU.
+    if dtype == torch.float32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 def get_vl_model():
@@ -233,18 +246,21 @@ def get_vl_model():
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
             )
-            logger.info("[v6.2] Loading model with 4-bit NF4 Quantization (Low-VRAM mode).")
+            logger.warning("[v6.2] Loading model with 4-bit NF4 Quantization (Low-VRAM mode) — "
+                           "marks will be LESS accurate. Unset USE_4BIT_QUANTIZATION for accurate evaluation.")
         else:
             # // Full unquantized mode (bfloat16 where supported — see GPU_DTYPE)
             logger.info("[v6.2] Loading model in FULL unquantized GPU mode.")
 
         model_kwargs["device_map"] = "auto"
         model_kwargs["torch_dtype"] = _resolve_gpu_dtype()
+        _configure_gpu_precision(model_kwargs["torch_dtype"])
     else:
         model_kwargs["device_map"] = "cpu"
         model_kwargs["torch_dtype"] = torch.float32
 
     # Attention kernel: FlashAttention-2 when installed (fastest; bf16 only), else PyTorch SDPA.
+    # In float32 (the accurate default) this is always SDPA, which runs full float32 attention.
     if IS_CUDA and model_kwargs["torch_dtype"] == torch.bfloat16 and importlib.util.find_spec("flash_attn"):
         model_kwargs["attn_implementation"] = "flash_attention_2"
     else:
@@ -268,6 +284,10 @@ def get_vl_model():
     _vl_model.eval()
     logger.info(f"[v6.2] Unified VL model loaded | CUDA={IS_CUDA} | 4-Bit={USE_4BIT_QUANTIZATION} | "
                 f"dtype={model_kwargs.get('torch_dtype')} | attn={model_kwargs['attn_implementation']}")
+    if IS_CUDA:
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        used_gb = torch.cuda.memory_allocated(0) / 1024 ** 3
+        logger.info(f"[v6.2] GPU: {torch.cuda.get_device_name(0)} | VRAM {used_gb:.1f}GB used by model / {total_gb:.1f}GB total")
     return _vl_model, _vl_processor
 
 
@@ -1459,27 +1479,9 @@ def parse_model_answers(answer_key_text: str, questions: Optional[List[Extracted
 #  SECTION 5: EXAM-LEVEL PREPROCESSING & RUBRIC CACHE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# In-memory rubric cache: cache_key → RubricAllocation
-_rubric_cache: Dict[str, RubricAllocation] = {}
-_rubric_cache_lock = threading.Lock()
-
-
-def _rubric_cache_key(exam_id: str, question_id: str, answer_hash: str, total_marks: float) -> str:
-    return hashlib.md5(f"{exam_id}:{question_id}:{answer_hash}:{total_marks}".encode()).hexdigest()
-
-
-def get_cached_rubric(exam_id: str, question_id: str, expected_answer: str, total_marks: float) -> Optional[RubricAllocation]:
-    """Retrieve cached rubric allocation for an exam question."""
-    key = _rubric_cache_key(exam_id, question_id, hashlib.md5(expected_answer.encode()).hexdigest()[:16], total_marks)
-    with _rubric_cache_lock:
-        return _rubric_cache.get(key)
-
-
-def cache_rubric(exam_id: str, question_id: str, expected_answer: str, total_marks: float, rubric: RubricAllocation):
-    """Cache rubric allocation for an exam question."""
-    key = _rubric_cache_key(exam_id, question_id, hashlib.md5(expected_answer.encode()).hexdigest()[:16], total_marks)
-    with _rubric_cache_lock:
-        _rubric_cache[key] = rubric
+# No rubric cache: rubrics are rebuilt for every request. A process-wide cache
+# survived for the server's whole lifetime, ignored question text/type in its key,
+# and kept a fallback "pure text" rubric forever after one failed VL call.
 
 
 def generate_rubric_for_question(
@@ -1487,12 +1489,7 @@ def generate_rubric_for_question(
     expected_answer: str,
     exam_id: str = "",
 ) -> RubricAllocation:
-    """Generate rubric allocation for a single question. Uses cache if available."""
-    # Check cache first
-    cached = get_cached_rubric(exam_id, question.question_id, expected_answer, question.max_marks)
-    if cached:
-        return cached
-
+    """Generate rubric allocation for a single question."""
     total = question.max_marks
     has_diag = question.has_diagram_reference
 
@@ -1503,8 +1500,6 @@ def generate_rubric_for_question(
             text_marks=total, visual_marks=0.0,
             allocation_confidence=1.0, allocation_source="deterministic_type",
         )
-        if exam_id:
-            cache_rubric(exam_id, question.question_id, expected_answer, total, rubric)
         return rubric
 
     if question.question_type == QuestionType.DIAGRAM and has_diag:
@@ -1516,8 +1511,6 @@ def generate_rubric_for_question(
             has_diagram=True, allocation_confidence=0.85,
             allocation_source="deterministic_diagram",
         )
-        if exam_id:
-            cache_rubric(exam_id, question.question_id, expected_answer, total, rubric)
         return rubric
 
     # LLM-powered rubric for ambiguous cases (e.g., mixed text+diagram)
@@ -1547,8 +1540,6 @@ Return ONLY valid JSON:
                     has_diagram=diag, allocation_confidence=0.75,
                     allocation_source="vl_inferred",
                 )
-                if exam_id:
-                    cache_rubric(exam_id, question.question_id, expected_answer, total, rubric)
                 return rubric
         except Exception as e:
             logger.warning(f"[Rubric] VL inference failed for {question.question_id}: {e}")
@@ -1560,8 +1551,6 @@ Return ONLY valid JSON:
         has_diagram=has_diag, allocation_confidence=0.85,
         allocation_source="default_text",
     )
-    if exam_id:
-        cache_rubric(exam_id, question.question_id, expected_answer, total, rubric)
     return rubric
 
 
@@ -1570,23 +1559,14 @@ def preprocess_exam_rubrics(
     model_answers: Dict[str, str],
     exam_id: str,
 ) -> Dict[str, RubricAllocation]:
-    """Preprocess and cache rubric allocations for all questions in an exam."""
+    """Build fresh rubric allocations for all questions in an exam (no caching)."""
     allocations: Dict[str, RubricAllocation] = {}
-    cache_hits = 0
-    cache_misses = 0
 
     for q in questions:
         expected = _resolve_model_answer(q.question_id, model_answers)
-        cached = get_cached_rubric(exam_id, q.question_id, expected, q.max_marks)
-        if cached:
-            allocations[q.question_id] = cached
-            cache_hits += 1
-        else:
-            rubric = generate_rubric_for_question(q, expected, exam_id)
-            allocations[q.question_id] = rubric
-            cache_misses += 1
+        allocations[q.question_id] = generate_rubric_for_question(q, expected, exam_id)
 
-    logger.info(f"[Rubric Cache] Exam {exam_id}: {cache_hits} hits, {cache_misses} misses, {len(allocations)} total")
+    logger.info(f"[Rubric] Exam {exam_id}: built {len(allocations)} rubric(s)")
     return allocations
 
 
@@ -2687,8 +2667,8 @@ RESPOND ONLY WITH VALID JSON:
     return result
 
 
-def evaluate_diagram(evidence: EvidencePacket, cache_key: Optional[str] = None) -> VisualEvalResult:
-    """Evaluate visual/diagram answer using targeted page image crops (with pre-eval cache lookup)."""
+def evaluate_diagram(evidence: EvidencePacket) -> VisualEvalResult:
+    """Evaluate visual/diagram answer using targeted page image crops."""
     result = VisualEvalResult(max_marks=evidence.rubric.visual_marks)
 
     if evidence.rubric.visual_marks <= 0:
@@ -2700,14 +2680,6 @@ def evaluate_diagram(evidence: EvidencePacket, cache_key: Optional[str] = None) 
         result.skipped = True
         result.skip_reason = f"Question type {evidence.question_type.value} has no visual component."
         return result
-
-    # ⚡ Check Parallel Visual Pre-Evaluation Cache (0ms latency!)
-    if cache_key:
-        with _cache_lock:
-            cached_map = _visual_eval_cache.get(cache_key)
-            if cached_map and evidence.question_id in cached_map:
-                logger.info(f"[VisualEval] Cache HIT for {evidence.question_id} in key={cache_key} (0ms latency)")
-                return cached_map[evidence.question_id]
 
     # Only send targeted page images (not full 30-page PDF)
     image_paths = []
@@ -3144,9 +3116,6 @@ def evidence_selector_node(state: PipelineGraphState) -> Dict[str, Any]:
 def parallel_evaluator_node(state: PipelineGraphState) -> Dict[str, Any]:
     """Agent 7: Evaluate all questions in controlled parallel (max_workers=3)."""
     evidence_packets = state.get("evidence_packets", [])
-    exam_id = state.get("exam_id", "1")
-    student_id = state.get("student_id", "1")
-    cache_key = f"{exam_id}_{student_id}"
     metadata = state.get("metadata", PipelineMetadata())
 
     t0 = time.time()
@@ -3154,7 +3123,7 @@ def parallel_evaluator_node(state: PipelineGraphState) -> Dict[str, Any]:
     def process_question(ev: EvidencePacket) -> AggregatedResult:
         t_q = time.time()
         text_res = evaluate_text_answer(ev)
-        visual_res = evaluate_diagram(ev, cache_key=cache_key)
+        visual_res = evaluate_diagram(ev)
         agg = aggregate_marks(ev, text_res, visual_res)
         logger.info(f"[Agent 7: Evaluator] {ev.question_id} evaluated in {round(time.time() - t_q, 2)}s: score={agg.final_score}/{agg.final_max_marks} ({agg.status})")
         return agg
@@ -3443,7 +3412,7 @@ async def health_check():
         "agents": [
             "Agent 1: Exam Cache Loader (Deterministic)",
             "Agent 2: Student OCR Normalizer (Deterministic)",
-            "Agent 3: Rubric Preprocessor (LLM + Cache)",
+            "Agent 3: Rubric Preprocessor (LLM, per request)",
             "Agent 4: Hybrid Answer Mapper (Code + VL + DP)",
             "Agent 5: Mapping Validator (Rules + Security)",
             "Agent 6: Evidence Selector (Targeted Crops)",
@@ -3456,92 +3425,35 @@ async def health_check():
             "max_questions": MAX_QUESTIONS_SUPPORTED,
             "eval_concurrency": MAX_EVAL_CONCURRENCY,
             "hierarchical_question_ids": True,
-            "rubric_caching": True,
-            "visual_pre_evaluation": True,
+            "rubric_caching": False,
+            "visual_pre_evaluation": False,
             "targeted_page_cropping": True,
             "non_destructive_security": True,
             "diagram_evaluation": True,
         },
-        "rubric_cache_size": len(_rubric_cache),
-        "visual_cache_size": len(_visual_eval_cache),
+        "cuda": IS_CUDA,
+        "model_dtype": str(_vl_model.dtype) if _vl_model is not None else None,
+        "quantized_4bit": USE_4BIT_QUANTIZATION,
     }
 
 
 @app.post("/visual-pre-eval")
 async def visual_pre_eval_endpoint(req: VisualPreEvalRequest):
-    """Pre-evaluate visual/diagram questions in parallel while Chandra OCR runs."""
-    logger.info(f"[/visual-pre-eval] student_id={req.student_id}, exam_id={req.exam_id}")
-    t0 = time.time()
-    cache_key = f"{req.exam_id}_{req.student_id}"
+    """Kept for backend compatibility only — does nothing.
 
-    # Parse questions & model answers (Agent 1)
-    clean_q = detect_and_parse_input(req.question_paper_text)
-    clean_a = normalize_ocr_text(detect_and_parse_input(req.answer_key_text))
-    questions = build_question_tree(clean_q, float(req.max_marks))
-    model_answers = parse_model_answers(clean_a, questions)
-
-    # Pre-process rubrics (Agent 3)
-    rubrics = preprocess_exam_rubrics(questions, model_answers, req.exam_id)
-    diagram_qs = [
-        q for q in questions
-        if rubrics.get(q.question_id, RubricAllocation(q.question_id, q.max_marks, q.max_marks, 0.0)).has_diagram
-    ]
-
-    if not diagram_qs:
-        return {
-            "status": "success",
-            "exam_id": req.exam_id,
-            "student_id": req.student_id,
-            "diagram_questions_count": 0,
-            "cached_count": 0,
-            "message": "No diagram questions in exam.",
-        }
-
-    # Extract page images from PDF/Image base64 if provided
-    session_id = hashlib.md5(f"{req.student_id}{req.exam_id}{t0}".encode()).hexdigest()[:12]
-    page_images: List[str] = []
-    if req.student_pdf_base64:
-        try:
-            file_bytes = base64.b64decode(req.student_pdf_base64)
-            page_images = extract_page_images_from_bytes(file_bytes, session_id, "student_preeval")
-            logger.info(f"[/visual-pre-eval] Extracted {len(page_images)} page image(s) from student file ({len(file_bytes)} bytes)")
-        except Exception as e:
-            logger.error(f"[/visual-pre-eval] PDF/Image base64 decode error: {e}")
-
-    cached_results: Dict[str, VisualEvalResult] = {}
-    logger.info(f"[/visual-pre-eval] Detected {len(diagram_qs)} diagram question(s) for key={cache_key}: {[q.question_id for q in diagram_qs]}")
-    try:
-        for idx, q in enumerate(diagram_qs, 1):
-            rubric = rubrics[q.question_id]
-            expected_ans = model_answers.get(q.question_id, "")
-            evidence = EvidencePacket(
-                question_id=q.question_id,
-                question_text=q.question_text,
-                question_type=q.question_type,
-                expected_answer=expected_ans,
-                student_answer="",
-                rubric=rubric,
-                student_page_images=page_images,
-            )
-            logger.info(f"[/visual-pre-eval] [{idx}/{len(diagram_qs)}] Running Qwen-VL diagram evaluation for {q.question_id}...")
-            v_res = evaluate_diagram(evidence)
-            cached_results[q.question_id] = v_res
-    finally:
-        # Page images are temporary — the cached results below are all that is kept.
-        cleanup_session_images(session_id)
-
-    with _cache_lock:
-        _visual_eval_cache[cache_key] = cached_results
-
-    elapsed = round(time.time() - t0, 3)
-    logger.info(f"[/visual-pre-eval] Pre-evaluated {len(cached_results)} diagram questions in {elapsed}s for key={cache_key}")
+    Diagram pre-evaluation was removed: it graded diagrams with no student answer,
+    the first 2 sheet pages and no answer key, then the real evaluation reused that
+    cached result instead of grading the correct pages. Diagrams are now always
+    evaluated inside /evaluate-text and /evaluate-paper with full evidence.
+    """
+    logger.info(f"[/visual-pre-eval] student_id={req.student_id}, exam_id={req.exam_id} — no-op (pre-evaluation disabled)")
     return {
         "status": "success",
         "exam_id": req.exam_id,
         "student_id": req.student_id,
-        "diagram_questions_count": len(diagram_qs),
-        "cached_count": len(cached_results),
-        "processing_time_seconds": elapsed,
+        "diagram_questions_count": 0,
+        "cached_count": 0,
+        "message": "Visual pre-evaluation disabled; diagrams are evaluated during the main evaluation.",
     }
 
 
@@ -3575,9 +3487,6 @@ async def evaluate_text_endpoint(req: TextEvaluationRequest):
     finally:
         # Page images are temporary — remove them once this sheet is evaluated.
         cleanup_session_images(session_id)
-        # The diagram pre-scan cache for this sheet has been used — free the memory.
-        with _cache_lock:
-            _visual_eval_cache.pop(f"{req.exam_id}_{req.student_id}", None)
 
 
 @app.post("/evaluate-paper", response_model=EvaluationResponse)
@@ -3627,17 +3536,13 @@ async def evaluate_paper_endpoint(
         )
     finally:
         cleanup_session_images(session_id)
-        # Same as /evaluate-text: drop this sheet's diagram pre-scan so the next
-        # sheet with the same exam_id/student_id never reuses stale diagram marks.
-        with _cache_lock:
-            _visual_eval_cache.pop(f"{exam_id}_{student_id}", None)
 
     return result
 
 
 @app.post("/preprocess-exam")
 async def preprocess_exam_endpoint(req: ExamPreprocessRequest):
-    """Exam-level preprocessing: generate and cache rubrics for all questions."""
+    """Exam-level preprocessing: generate rubrics for all questions (report only, nothing is cached)."""
     logger.info(f"[/preprocess-exam] exam_id={req.exam_id}")
 
     clean_q = detect_and_parse_input(req.question_paper_text)
@@ -3657,7 +3562,7 @@ async def preprocess_exam_endpoint(req: ExamPreprocessRequest):
         "rubrics_cached": len(rubrics),
         "diagram_questions": sum(1 for r in rubrics.values() if r.has_diagram),
         "processing_time_seconds": elapsed,
-        "cache_size": len(_rubric_cache),
+        "cache_size": 0,  # rubric caching removed — kept for backend compatibility
     }
 
 
