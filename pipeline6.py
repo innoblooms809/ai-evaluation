@@ -46,6 +46,7 @@ import html
 import unicodedata
 import threading
 import functools
+import importlib.util
 import tempfile
 from enum import Enum
 from pathlib import Path
@@ -186,6 +187,20 @@ USE_4BIT_QUANTIZATION = os.getenv("USE_4BIT_QUANTIZATION", "false").lower() == "
 # // Set MAX_EVAL_CONCURRENCY = 8 for 80GB VRAM / 24+ CPU Core enterprise servers to evaluate 8 questions in parallel!
 MAX_EVAL_CONCURRENCY = int(os.getenv("MAX_EVAL_CONCURRENCY", "8"))
 
+# // GPU precision: "auto" = bfloat16 where the GPU supports it, else float32.
+# // Set GPU_DTYPE=float32 to match CPU (local) results exactly (needs ~16GB free VRAM).
+# // float16 is never used — Qwen2.5-VL overflows in fp16 and produces garbage scores.
+GPU_DTYPE = os.getenv("GPU_DTYPE", "auto").lower()
+
+
+def _resolve_gpu_dtype() -> torch.dtype:
+    if GPU_DTYPE in ("float32", "fp32"):
+        return torch.float32
+    if GPU_DTYPE in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    # auto: older GPUs (T4, V100, P100) have no native bfloat16 → use float32
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+
 
 def get_vl_model():
     """Load or return cached Qwen2.5-VL-3B-Instruct model (unified for text + vision)."""
@@ -220,25 +235,54 @@ def get_vl_model():
             )
             logger.info("[v6.2] Loading model with 4-bit NF4 Quantization (Low-VRAM mode).")
         else:
-            # // Full unquantized bfloat16 mode (for 80GB VRAM GPUs — 2.5x faster inference!)
-            logger.info("[v6.2] Loading model in FULL bfloat16 Unquantized mode (High-VRAM 80GB mode — 2.5x Speedup).")
+            # // Full unquantized mode (bfloat16 where supported — see GPU_DTYPE)
+            logger.info("[v6.2] Loading model in FULL unquantized GPU mode.")
 
         model_kwargs["device_map"] = "auto"
-        model_kwargs["torch_dtype"] = torch.bfloat16
+        model_kwargs["torch_dtype"] = _resolve_gpu_dtype()
     else:
         model_kwargs["device_map"] = "cpu"
         model_kwargs["torch_dtype"] = torch.float32
 
+    # Attention kernel: FlashAttention-2 when installed (fastest; bf16 only), else PyTorch SDPA.
+    if IS_CUDA and model_kwargs["torch_dtype"] == torch.bfloat16 and importlib.util.find_spec("flash_attn"):
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+    else:
+        model_kwargs["attn_implementation"] = "sdpa"
+
     # Load model
     try:
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        _vl_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(VL_MODEL_PATH, **model_kwargs)
+        from transformers import Qwen2_5_VLForConditionalGeneration as _vl_class
     except ImportError:
-        _vl_model = AutoModelForCausalLM.from_pretrained(VL_MODEL_PATH, **model_kwargs)
+        _vl_class = AutoModelForCausalLM
+    try:
+        _vl_model = _vl_class.from_pretrained(VL_MODEL_PATH, **model_kwargs)
+    except Exception as e:
+        if model_kwargs["attn_implementation"] != "flash_attention_2":
+            raise
+        # A broken flash_attn install must never take the server down.
+        logger.warning(f"[VL] FlashAttention-2 failed to load ({e}) — falling back to SDPA.")
+        model_kwargs["attn_implementation"] = "sdpa"
+        _vl_model = _vl_class.from_pretrained(VL_MODEL_PATH, **model_kwargs)
 
     _vl_model.eval()
-    logger.info(f"[v6.2] Unified VL model loaded | CUDA={IS_CUDA} | 4-Bit={USE_4BIT_QUANTIZATION} | dtype={model_kwargs.get('torch_dtype')}")
+    logger.info(f"[v6.2] Unified VL model loaded | CUDA={IS_CUDA} | 4-Bit={USE_4BIT_QUANTIZATION} | "
+                f"dtype={model_kwargs.get('torch_dtype')} | attn={model_kwargs['attn_implementation']}")
     return _vl_model, _vl_processor
+
+
+def _greedy_generate(model, inputs, max_new_tokens: int):
+    # Greedy decoding: the same sheet must always get the same marks.
+    # Sampling (do_sample=True) gives different scores run-to-run, and
+    # bfloat16 on GPU makes that drift much larger than float32 on CPU.
+    return model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+    )
 
 
 def generate_with_vl(prompt: str, image_paths: Optional[List[str]] = None, max_new_tokens: int = 1024) -> str:
@@ -266,16 +310,17 @@ def generate_with_vl(prompt: str, image_paths: Optional[List[str]] = None, max_n
         else:
             inputs = processor(text=[text_prompt], padding=True, return_tensors="pt")
 
-        inputs = inputs.to(model.device)
-
-        with torch.no_grad():
+        with torch.inference_mode():
             with _vl_model_lock:
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    temperature=0.1,
-                    do_sample=True,
-                )
+                # Move to GPU only while holding the lock, so queued requests
+                # don't each park their image tensors in VRAM at the same time.
+                inputs = inputs.to(model.device)
+                try:
+                    generated_ids = _greedy_generate(model, inputs, max_new_tokens)
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning("[VL] CUDA out of memory — freeing cached VRAM and retrying once.")
+                    torch.cuda.empty_cache()
+                    generated_ids = _greedy_generate(model, inputs, max_new_tokens)
 
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         output = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
@@ -3582,6 +3627,10 @@ async def evaluate_paper_endpoint(
         )
     finally:
         cleanup_session_images(session_id)
+        # Same as /evaluate-text: drop this sheet's diagram pre-scan so the next
+        # sheet with the same exam_id/student_id never reuses stale diagram marks.
+        with _cache_lock:
+            _visual_eval_cache.pop(f"{exam_id}_{student_id}", None)
 
     return result
 
