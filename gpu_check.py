@@ -8,6 +8,15 @@ import torch
 
 print("torch       :", meta.version("torch"), "| built for CUDA", torch.version.cuda)
 print("transformers:", meta.version("transformers"))
+
+try:
+    import torchvision
+    print("torchvision :", meta.version("torchvision"))
+except Exception as e:
+    print("torchvision :", "MISSING/BROKEN -", e)
+    print("RESULT      : FAIL - Qwen2.5-VL cannot load without torchvision")
+    print("FIX         : pip install torchvision --index-url https://download.pytorch.org/whl/cu130")
+    raise SystemExit(1)
 print("CUDA usable :", torch.cuda.is_available())
 
 if not torch.cuda.is_available():
