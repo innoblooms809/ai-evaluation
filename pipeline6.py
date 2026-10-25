@@ -46,6 +46,7 @@ import html
 import unicodedata
 import threading
 import functools
+import contextvars
 import importlib.util
 import tempfile
 from enum import Enum
@@ -84,6 +85,8 @@ os.environ["MKL_NUM_THREADS"] = str(OPTIMAL_TORCH_THREADS)
 os.environ["OMP_NUM_THREADS"] = str(OPTIMAL_TORCH_THREADS)
 os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
 os.environ["KMP_BLOCKTIME"] = "1"
+# Return freed VRAM in small pieces instead of fragmenting it — the GPU is shared with the OCR server.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 torch.set_num_threads(OPTIMAL_TORCH_THREADS)
 
 # ── Pipeline Constants ──
@@ -144,6 +147,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline6")
 
+# ── Per-request problem collector ──
+# Every WARNING/ERROR logged while an evaluation runs is also stored for that
+# request, so the end-of-run report can list exactly what went wrong.
+_request_issues: contextvars.ContextVar[Optional[List[str]]] = contextvars.ContextVar("request_issues", default=None)
+
+
+class _RequestIssueCollector(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        issues = _request_issues.get()
+        if issues is not None:
+            issues.append(f"{record.levelname}: {record.getMessage()}")
+
+
+logger.addHandler(_RequestIssueCollector())
+
 # ── Optional Imports ──
 try:
     import fitz as pymupdf
@@ -194,6 +215,14 @@ MAX_EVAL_CONCURRENCY = int(os.getenv("MAX_EVAL_CONCURRENCY", "8"))
 # // float16 is never used — Qwen2.5-VL overflows in fp16 and produces garbage scores.
 GPU_DTYPE = os.getenv("GPU_DTYPE", "float32").lower()
 FP32_MIN_VRAM_GB = 24
+
+# // VRAM share for THIS process. The 80GB GPU also runs the Chandra OCR server, so
+# // the evaluator is capped (default 45% = 36GB: model ~16GB float32 + ~20GB working
+# // space) and the rest is guaranteed to stay free for OCR.
+GPU_MEMORY_FRACTION = float(os.getenv("GPU_MEMORY_FRACTION", "0.45"))
+
+# Filled in by get_vl_model(); printed in /health and in every evaluation report.
+_vl_runtime: Dict[str, Any] = {}
 
 
 def _resolve_gpu_dtype() -> torch.dtype:
@@ -255,6 +284,7 @@ def get_vl_model():
         model_kwargs["device_map"] = "auto"
         model_kwargs["torch_dtype"] = _resolve_gpu_dtype()
         _configure_gpu_precision(model_kwargs["torch_dtype"])
+        torch.cuda.set_per_process_memory_fraction(GPU_MEMORY_FRACTION, 0)
     else:
         model_kwargs["device_map"] = "cpu"
         model_kwargs["torch_dtype"] = torch.float32
@@ -284,10 +314,19 @@ def get_vl_model():
     _vl_model.eval()
     logger.info(f"[v6.2] Unified VL model loaded | CUDA={IS_CUDA} | 4-Bit={USE_4BIT_QUANTIZATION} | "
                 f"dtype={model_kwargs.get('torch_dtype')} | attn={model_kwargs['attn_implementation']}")
+    _vl_runtime.update({
+        "device": f"cuda ({torch.cuda.get_device_name(0)})" if IS_CUDA else "cpu",
+        "dtype": str(model_kwargs.get("torch_dtype")).replace("torch.", ""),
+        "attn": model_kwargs["attn_implementation"],
+        "quantized_4bit": bool(IS_CUDA and USE_4BIT_QUANTIZATION),
+    })
     if IS_CUDA:
         total_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
         used_gb = torch.cuda.memory_allocated(0) / 1024 ** 3
-        logger.info(f"[v6.2] GPU: {torch.cuda.get_device_name(0)} | VRAM {used_gb:.1f}GB used by model / {total_gb:.1f}GB total")
+        _vl_runtime["vram_limit_gb"] = round(total_gb * GPU_MEMORY_FRACTION, 1)
+        logger.info(f"[v6.2] GPU: {torch.cuda.get_device_name(0)} | VRAM {used_gb:.1f}GB used by model / "
+                    f"{_vl_runtime['vram_limit_gb']}GB allowed for evaluator / {total_gb:.1f}GB total "
+                    f"(rest kept free for OCR)")
     return _vl_model, _vl_processor
 
 
@@ -1513,8 +1552,11 @@ def generate_rubric_for_question(
         )
         return rubric
 
-    # LLM-powered rubric for ambiguous cases (e.g., mixed text+diagram)
-    if has_diag or total >= 5:
+    # LLM-powered rubric only for questions that actually reference a diagram.
+    # (Previously also for any question >= 5 marks: the model sometimes gave a pure
+    # text question "visual" marks, the diagram check was then skipped for lack of an
+    # image, and the student could never reach full marks.)
+    if has_diag:
         try:
             prompt = f"""Analyze this exam question and determine marks split between text and diagram.
 
@@ -2636,7 +2678,8 @@ RESPOND ONLY WITH VALID JSON:
 
     for attempt in range(1 + MAX_LLM_RETRIES):
         try:
-            raw = generate_with_vl(prompt, max_new_tokens=250)
+            # 512 tokens: Devanagari feedback is token-heavy and 250 truncated the JSON.
+            raw = generate_with_vl(prompt, max_new_tokens=512)
             parsed, parse_conf = _parse_json_response(raw)
 
             score = float(parsed.get("score", 0.0))
@@ -3128,9 +3171,11 @@ def parallel_evaluator_node(state: PipelineGraphState) -> Dict[str, Any]:
         logger.info(f"[Agent 7: Evaluator] {ev.question_id} evaluated in {round(time.time() - t_q, 2)}s: score={agg.final_score}/{agg.final_max_marks} ({agg.status})")
         return agg
 
-    # Controlled GPU concurrency
+    # Controlled GPU concurrency. Each task runs in a copy of this request's context
+    # so warnings from worker threads still reach the request's problem report.
+    contexts = [contextvars.copy_context() for _ in evidence_packets]
     with ThreadPoolExecutor(max_workers=MAX_EVAL_CONCURRENCY) as executor:
-        aggregated_results = list(executor.map(process_question, evidence_packets))
+        aggregated_results = list(executor.map(lambda ctx, ev: ctx.run(process_question, ev), contexts, evidence_packets))
 
     metadata.evaluation_time_seconds = round(time.time() - t0, 3)
     metadata.visual_evaluations_run = sum(1 for r in aggregated_results if not r.visual_result.skipped)
@@ -3329,6 +3374,128 @@ def create_pipeline6_graph() -> Any:
 pipeline6_graph = create_pipeline6_graph()
 
 
+def _question_problems(ev: Optional[EvidencePacket], agg: Optional[AggregatedResult],
+                       signals: Dict[str, Any]) -> List[str]:
+    """Plain-language reasons why this question's marks may be wrong."""
+    if ev is None or agg is None:
+        return ["question was not evaluated at all"]
+    problems: List[str] = []
+    answered = bool((ev.student_answer or "").strip())
+    rubric, text_res, vis_res = agg.rubric, agg.text_result, agg.visual_result
+
+    if not (ev.expected_answer or "").strip():
+        problems.append("NO MODEL ANSWER found in the answer key for this question -> text marks 0")
+    if not answered:
+        if signals.get("vl_rejected"):
+            problems.append("the AI rejected the matched text as not belonging to this question -> 0")
+        else:
+            problems.append("student answer NOT FOUND on the sheet (mapping/OCR) -> 0")
+    elif ev.alignment_confidence < LOW_CONFIDENCE_THRESHOLD:
+        problems.append(f"answer mapping uncertain (conf {ev.alignment_confidence:.2f}) - may be grading the wrong text")
+    if answered and (signals.get("llm_fallback") or signals.get("whole_sheet_fallback")):
+        problems.append("answer was located only by the fallback search - verify it is the right text")
+    if rubric.allocation_source == "question_mark_invariant":
+        problems.append("rubric marks did not match the question marks and were rebuilt")
+    if rubric.has_diagram and rubric.visual_marks <= 0 and rubric.allocation_source == "default_text":
+        problems.append("diagram question but the AI mark split failed -> diagram not graded")
+    if rubric.visual_marks > 0 and vis_res.skipped:
+        problems.append(f"{rubric.visual_marks} diagram marks NOT awarded: {vis_res.skip_reason}")
+    if text_res.reasoning == "Text evaluation failed after max retries.":
+        problems.append("text grading FAILED (model error) -> text marks 0")
+    elif answered and rubric.text_marks > 0 and text_res.parse_confidence <= 0.5:
+        problems.append("AI reply was not valid JSON - score was guessed from raw text")
+    if vis_res.diagram_feedback.startswith("Visual evaluation failed"):
+        problems.append("diagram grading FAILED (model error) -> diagram marks 0")
+    if ev.injection_flags:
+        problems.append(f"prompt-injection text detected in the answer ({len(ev.injection_flags)} patterns)")
+    return problems
+
+
+def _log_run_report(final_state: Dict[str, Any], input_source: str, elapsed: float, issues: List[str]) -> None:
+    """Print one end-of-run block: what ran, every question's result, and the problems found."""
+    questions: List[ExtractedQuestion] = final_state.get("questions", [])
+    evidence = {e.question_id: e for e in final_state.get("evidence_packets", [])}
+    results = {r.question_id: r for r in final_state.get("aggregated_results", [])}
+    signal_map = final_state.get("signal_map", {})
+    model_answers = final_state.get("model_answers", {})
+    ocr_conf = final_state.get("student_ocr_conf", 1.0)
+    student_words = len((final_state.get("clean_student") or "").split())
+    pages = len(final_state.get("student_page_images", []))
+    ak_pages = len(final_state.get("answer_key_page_images", []))
+
+    total = sum(r.final_score for r in results.values())
+    max_total = sum(r.final_max_marks for r in results.values())
+    pct = (total / max_total * 100.0) if max_total else 0.0
+
+    problems: List[str] = []
+    # ── Whole-run problems ──
+    if _vl_runtime.get("device", "cpu") == "cpu":
+        problems.append("RUNNING ON CPU - the server GPU is not being used")
+    if _vl_runtime.get("quantized_4bit"):
+        problems.append("4-bit quantization is ON - marks are less accurate (unset USE_4BIT_QUANTIZATION)")
+    if student_words < 10:
+        problems.append(f"student text is almost empty ({student_words} words) - OCR returned little or no text")
+    if ocr_conf < OCR_FALLBACK_CONFIDENCE:
+        problems.append(f"OCR text quality is LOW (conf {ocr_conf:.2f}) - check the OCR server output for this sheet")
+    if not model_answers:
+        problems.append("answer key could not be parsed - no model answers at all")
+    if len(questions) == 1 and questions[0].extraction_confidence <= 0.70:
+        problems.append("question paper could not be parsed - evaluated as ONE question")
+    if pages == 0 and any(r.rubric.visual_marks > 0 for r in results.values()):
+        problems.append("diagram questions exist but NO page images were sent - diagram marks cannot be given")
+    for w in final_state.get("validation_warnings", []):
+        problems.append(f"validation: {w}")
+
+    lines = [
+        "",
+        "=" * 100,
+        f" EVALUATION REPORT | student={final_state.get('student_id')} exam={final_state.get('exam_id')} | "
+        f"score {total:.1f}/{max_total:.1f} ({pct:.1f}%) | {elapsed:.1f}s",
+        "-" * 100,
+        f" RUN      device={_vl_runtime.get('device', 'not loaded')} | dtype={_vl_runtime.get('dtype')} | "
+        f"attn={_vl_runtime.get('attn')} | 4bit={_vl_runtime.get('quantized_4bit')} | decoding=greedy",
+        f" INPUT    source={input_source} | questions={len(questions)} | model answers={len(model_answers)} | "
+        f"student words={student_words} | OCR conf={ocr_conf:.2f} | pages={pages} student, {ak_pages} answer-key",
+    ]
+    if IS_CUDA:
+        peak_gb = torch.cuda.max_memory_allocated(0) / 1024 ** 3
+        lines.append(f" VRAM     peak {peak_gb:.1f}GB of {_vl_runtime.get('vram_limit_gb', '?')}GB evaluator limit")
+    lines.append("-" * 100)
+    lines.append(f" {'QUESTION':<12}{'MARKS':>11}  {'STATUS':<11}{'MAP CONF':>9}  {'MAPPED BY':<18}{'RUBRIC':<24}")
+
+    for q in questions:
+        ev, agg = evidence.get(q.question_id), results.get(q.question_id)
+        signals = signal_map.get(q.question_id, {})
+        q_problems = _question_problems(ev, agg, signals)
+        if agg and ev:
+            mapped_by = ("whole_sheet" if signals.get("whole_sheet_fallback") else
+                         "llm_fallback" if signals.get("llm_fallback") else ev.alignment_path)
+            lines.append(f" {q.question_id:<12}{agg.final_score:>5.1f}/{agg.final_max_marks:<5.1f}  {agg.status:<11}"
+                         f"{ev.alignment_confidence:>9.2f}  {mapped_by:<18}"
+                         f"{agg.rubric.allocation_source} t{agg.rubric.text_marks:g}+v{agg.rubric.visual_marks:g}")
+        else:
+            lines.append(f" {q.question_id:<12}{'-':>11}  NOT EVALUATED")
+        for p in q_problems:
+            lines.append(f"     ! {p}")
+        problems.extend(f"{q.question_id}: {p}" for p in q_problems)
+
+    # Logged warnings/errors from this request (model errors, OOM retries, parse failures...)
+    seen: Set[str] = set()
+    logged = [i for i in issues if not (i in seen or seen.add(i))]
+    problems.extend(f"log {i}" for i in logged[:15])
+    if len(logged) > 15:
+        problems.append(f"... and {len(logged) - 15} more warnings/errors in the log above")
+
+    lines.append("-" * 100)
+    if problems:
+        lines.append(f" PROBLEMS FOUND ({len(problems)}) - these are why marks may be wrong:")
+        lines.extend(f"   {n}. {p}" for n, p in enumerate(problems, 1))
+    else:
+        lines.append(" PROBLEMS FOUND: none - every question was mapped, graded and parsed cleanly.")
+    lines.append("=" * 100)
+    logger.info("\n".join(lines))
+
+
 def run_pipeline6(
     question_paper_text: str,
     answer_key_text: str,
@@ -3338,10 +3505,15 @@ def run_pipeline6(
     default_max_marks: int = DEFAULT_MAX_MARKS,
     student_page_images: Optional[List[str]] = None,
     answer_key_page_images: Optional[List[str]] = None,
+    input_source: str = "text",
 ) -> EvaluationResponse:
     """Main orchestrator for v6.2 pipeline."""
     pipeline_start = time.time()
     session_id = hashlib.md5(f"{student_id}{exam_id}{pipeline_start}".encode()).hexdigest()[:12]
+    issues: List[str] = []
+    issues_token = _request_issues.set(issues)
+    if IS_CUDA:
+        torch.cuda.reset_peak_memory_stats(0)
 
     initial_state: PipelineGraphState = {
         "question_paper_text": question_paper_text,
@@ -3357,7 +3529,21 @@ def run_pipeline6(
         "pipeline_start": pipeline_start,
     }
 
-    final_state = pipeline6_graph.invoke(initial_state)
+    try:
+        final_state = pipeline6_graph.invoke(initial_state)
+    except Exception as e:
+        logger.error(f"[Pipeline] Evaluation crashed for student={student_id} exam={exam_id}: {e}")
+        raise
+    finally:
+        _request_issues.reset(issues_token)
+        if IS_CUDA:
+            # Give cached VRAM back so the OCR server on the same GPU can use it.
+            torch.cuda.empty_cache()
+
+    try:
+        _log_run_report(final_state, input_source, time.time() - pipeline_start, issues)
+    except Exception as e:  # the report must never break an evaluation
+        logger.warning(f"[Report] Could not build evaluation report: {e}")
 
     if "final_response" in final_state and final_state["final_response"]:
         return final_state["final_response"]
@@ -3483,6 +3669,7 @@ async def evaluate_text_endpoint(req: TextEvaluationRequest):
             exam_id=req.exam_id,
             default_max_marks=req.max_marks,
             student_page_images=student_page_images,
+            input_source="evaluate-text (text sent by backend)",
         )
     finally:
         # Page images are temporary — remove them once this sheet is evaluated.
@@ -3533,6 +3720,7 @@ async def evaluate_paper_endpoint(
             default_max_marks=max_marks,
             student_page_images=student_page_images,
             answer_key_page_images=answer_key_page_images,
+            input_source=f"evaluate-paper (student file '{student_file.filename}' via OCR {OCR_SERVER_URL})",
         )
     finally:
         cleanup_session_images(session_id)
@@ -3587,15 +3775,23 @@ async def _call_ocr_server(file_bytes: bytes, filename: str) -> str:
 
     logger.info(f"[OCR] Sending {filename} ({len(file_bytes)} bytes) to Chandra OCR")
     client = get_ocr_client()
+    t_ocr = time.time()
     try:
         response = await client.post(OCR_SERVER_URL, files={"file": (filename, file_bytes)})
         response.raise_for_status()
     except Exception as e:
+        logger.error(f"[OCR] FAILED for {filename} at {OCR_SERVER_URL}: {e} — evaluation aborted (HTTP 502)")
         raise HTTPException(502, f"OCR server error: {str(e)}")
-    return response.json().get("combined_markdown", "")
+    text = response.json().get("combined_markdown", "")
+    words = len(text.split())
+    log = logger.warning if words < 10 else logger.info
+    log(f"[OCR] {filename}: {words} words returned in {time.time() - t_ocr:.1f}s"
+        + (" — OCR output is (almost) EMPTY, marks will be wrong" if words < 10 else ""))
+    return text
 
 
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"🚀 Launching Pipeline v{PIPELINE_VERSION} on http://0.0.0.0:8006")
-    uvicorn.run("pipeline6:app", host="0.0.0.0", port=8006, reload=True)
+    # No reload in production: a file change would restart the server mid-evaluation.
+    uvicorn.run("pipeline6:app", host="0.0.0.0", port=8006, reload=False)
