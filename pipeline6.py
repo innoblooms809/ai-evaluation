@@ -62,6 +62,12 @@ from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 
 import httpx
+
+# Plain eager PyTorch only: no torch.compile, so no Triton JIT. On the server the
+# Triton helper failed to build with gcc and EVERY model call failed. Eager mode
+# gives identical marks and needs no compiler. (Must be set before importing torch.)
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 import torch
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
@@ -2828,7 +2834,16 @@ def aggregate_marks(evidence: EvidencePacket, text_result: TextEvalResult, visua
         student_ans_clean in ("no answer", "unanswered", "no student answer response extracted.")
     )
 
-    if is_unanswered and not evidence.student_page_images:
+    grading_failed = (
+        text_result.reasoning == "Text evaluation failed after max retries."
+        or visual_result.diagram_feedback.startswith("Visual evaluation failed")
+    )
+
+    if grading_failed and not is_unanswered:
+        # The model crashed — this is NOT the student's fault. Never call it "Incorrect".
+        status = "Needs Review"
+        review_reasons.append("AI grading failed (model error) — marks not assigned, grade manually")
+    elif is_unanswered and not evidence.student_page_images:
         final_score = 0.0
         status = "Unanswered"
     elif is_unanswered:
@@ -3412,11 +3427,11 @@ def _question_problems(ev: Optional[EvidencePacket], agg: Optional[AggregatedRes
     if rubric.visual_marks > 0 and vis_res.skipped:
         problems.append(f"{rubric.visual_marks} diagram marks NOT awarded: {vis_res.skip_reason}")
     if text_res.reasoning == "Text evaluation failed after max retries.":
-        problems.append("text grading FAILED (model error) -> text marks 0")
+        problems.append("text grading FAILED (model error) -> 'Needs Review', not graded")
     elif answered and rubric.text_marks > 0 and text_res.parse_confidence <= 0.5:
         problems.append("AI reply was not valid JSON - score was guessed from raw text")
     if vis_res.diagram_feedback.startswith("Visual evaluation failed"):
-        problems.append("diagram grading FAILED (model error) -> diagram marks 0")
+        problems.append("diagram grading FAILED (model error) -> 'Needs Review', not graded")
     if ev.injection_flags:
         problems.append(f"prompt-injection text detected in the answer ({len(ev.injection_flags)} patterns)")
     return problems
@@ -3472,7 +3487,7 @@ def _log_run_report(final_state: Dict[str, Any], input_source: str, elapsed: flo
         peak_gb = torch.cuda.max_memory_allocated(0) / 1024 ** 3
         lines.append(f" VRAM     peak {peak_gb:.1f}GB of {_vl_runtime.get('vram_limit_gb', '?')}GB evaluator limit")
     lines.append("-" * 100)
-    lines.append(f" {'QUESTION':<12}{'MARKS':>11}  {'STATUS':<11}{'MAP CONF':>9}  {'MAPPED BY':<24}RUBRIC")
+    lines.append(f" {'QUESTION':<12}{'MARKS':>11}  {'STATUS':<13}{'MAP CONF':>9}  {'MAPPED BY':<24}RUBRIC")
 
     for q in questions:
         ev, agg = evidence.get(q.question_id), results.get(q.question_id)
@@ -3481,7 +3496,7 @@ def _log_run_report(final_state: Dict[str, Any], input_source: str, elapsed: flo
         if agg and ev:
             mapped_by = ("whole_sheet" if signals.get("whole_sheet_fallback") else
                          "llm_fallback" if signals.get("llm_fallback") else ev.alignment_path)
-            lines.append(f" {q.question_id:<12}{agg.final_score:>5.1f}/{agg.final_max_marks:<5.1f}  {agg.status:<11}"
+            lines.append(f" {q.question_id:<12}{agg.final_score:>5.1f}/{agg.final_max_marks:<5.1f}  {agg.status:<13}"
                          f"{ev.alignment_confidence:>9.2f}  {mapped_by:<24}"
                          f"{agg.rubric.allocation_source} t{agg.rubric.text_marks:g}+v{agg.rubric.visual_marks:g}")
         else:
