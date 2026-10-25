@@ -1,5 +1,5 @@
 """
-pipeline6.py — AI Evaluation Pipeline v6.3 (Enterprise Production Standard)
+pipeline6.py — AI Evaluation Pipeline v6.2 (Enterprise Production Standard)
 
 Architecture Principle:
     Deterministic code handles all trusted structured exam data.
@@ -8,7 +8,7 @@ Architecture Principle:
     as an adjudication layer. Original page images are retained and cropped to
     relevant regions. Evaluation is question-parallel with controlled model concurrency.
 
-Key Features (v6.3):
+Key Features (v6.2):
     1. Single unified model: Qwen2.5-VL-3B-Instruct (text + vision)
     2. Exam-level rubric caching (generate once, reuse for 100s of students)
     3. Targeted page image cropping per question (not full 30-page PDFs)
@@ -86,8 +86,8 @@ os.environ["KMP_BLOCKTIME"] = "1"
 torch.set_num_threads(OPTIMAL_TORCH_THREADS)
 
 # ── Pipeline Constants ──
-PIPELINE_VERSION = "6.3.0"
-PROMPT_VERSION = "v6.3"
+PIPELINE_VERSION = "6.2.0"
+PROMPT_VERSION = "v6.2"
 VL_MODEL_VERSION = "Qwen2.5-VL-3B-Instruct"
 OCR_SERVER_URL = os.getenv("OCR_SERVER_URL", "http://151.185.34.160:8000/ocrOutput")
 DEFAULT_MAX_MARKS = 5
@@ -194,7 +194,7 @@ def get_vl_model():
     if _vl_model is not None:
         return _vl_model, _vl_processor
 
-    logger.info(f"[v6.3] Loading unified VL model: {VL_MODEL_PATH}")
+    logger.info(f"[v6.2] Loading unified VL model: {VL_MODEL_PATH}")
 
     # Processor
     from transformers import AutoProcessor
@@ -218,10 +218,10 @@ def get_vl_model():
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
             )
-            logger.info("[v6.3] Loading model with 4-bit NF4 Quantization (Low-VRAM mode).")
+            logger.info("[v6.2] Loading model with 4-bit NF4 Quantization (Low-VRAM mode).")
         else:
             # // Full unquantized bfloat16 mode (for 80GB VRAM GPUs — 2.5x faster inference!)
-            logger.info("[v6.3] Loading model in FULL bfloat16 Unquantized mode (High-VRAM 80GB mode — 2.5x Speedup).")
+            logger.info("[v6.2] Loading model in FULL bfloat16 Unquantized mode (High-VRAM 80GB mode — 2.5x Speedup).")
 
         model_kwargs["device_map"] = "auto"
         model_kwargs["torch_dtype"] = torch.bfloat16
@@ -237,7 +237,7 @@ def get_vl_model():
         _vl_model = AutoModelForCausalLM.from_pretrained(VL_MODEL_PATH, **model_kwargs)
 
     _vl_model.eval()
-    logger.info(f"[v6.3] Unified VL model loaded | CUDA={IS_CUDA} | 4-Bit={USE_4BIT_QUANTIZATION} | dtype={model_kwargs.get('torch_dtype')}")
+    logger.info(f"[v6.2] Unified VL model loaded | CUDA={IS_CUDA} | 4-Bit={USE_4BIT_QUANTIZATION} | dtype={model_kwargs.get('torch_dtype')}")
     return _vl_model, _vl_processor
 
 
@@ -515,7 +515,7 @@ class FeedbackDetail(BaseModel):
 
 class MetadataDetail(BaseModel):
     model: str = VL_MODEL_VERSION
-    evaluationVersion: str = "v6.3"
+    evaluationVersion: str = "v6.2"
     processingTime: float = 0.0
     timestamp: str = ""
     alignmentStats: Dict[str, Any] = Field(default_factory=dict)
@@ -2803,7 +2803,7 @@ def aggregate_marks(evidence: EvidencePacket, text_result: TextEvalResult, visua
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PipelineGraphState(TypedDict, total=False):
-    """v6.3 Production Pipeline State."""
+    """v6.2 Production Pipeline State."""
     # Inputs
     question_paper_text: str
     answer_key_text: str
@@ -3284,7 +3284,7 @@ def response_builder_node(state: PipelineGraphState) -> Dict[str, Any]:
 # ── StateGraph Construction ──
 
 def create_pipeline6_graph() -> Any:
-    """Build and compile the v6.3 9-Agent StateGraph."""
+    """Build and compile the v6.2 9-Agent StateGraph."""
     workflow = StateGraph(PipelineGraphState)
 
     workflow.add_node("exam_cache_loader", exam_cache_loader_node)
@@ -3325,7 +3325,7 @@ def run_pipeline6(
     student_page_images: Optional[List[str]] = None,
     answer_key_page_images: Optional[List[str]] = None,
 ) -> EvaluationResponse:
-    """Main orchestrator for v6.3 pipeline."""
+    """Main orchestrator for v6.2 pipeline."""
     pipeline_start = time.time()
     session_id = hashlib.md5(f"{student_id}{exam_id}{pipeline_start}".encode()).hexdigest()[:12]
 
@@ -3347,7 +3347,7 @@ def run_pipeline6(
 
     if "final_response" in final_state and final_state["final_response"]:
         return final_state["final_response"]
-    raise RuntimeError(f"Pipeline v6.3 execution failed: {final_state.get('error', 'Unknown error')}")
+    raise RuntimeError(f"Pipeline v6.2 execution failed: {final_state.get('error', 'Unknown error')}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3356,7 +3356,7 @@ def run_pipeline6(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Pipeline v6.3 starting — Pre-loading Qwen2.5-VL-3B-Instruct...")
+    logger.info("🚀 Pipeline v6.2 starting — Pre-loading Qwen2.5-VL-3B-Instruct...")
     try:
         get_vl_model()
         logger.info("✅ Unified VL model loaded! Server ready.")
@@ -3364,11 +3364,11 @@ async def lifespan(app: FastAPI):
         logger.warning(f"⚠️ Model pre-load failed (will lazy-load on demand): {e}")
     TEMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     yield
-    logger.info("👋 Pipeline v6.3 shutting down.")
+    logger.info("👋 Pipeline v6.2 shutting down.")
 
 
 app = FastAPI(
-    title="AI Evaluation Pipeline v6.3 (Enterprise Production)",
+    title="AI Evaluation Pipeline v6.2 (Enterprise Production)",
     description=(
         "Production-grade exam evaluation. Unified Qwen2.5-VL-3B model. "
         "Exam-level rubric caching. Targeted page cropping. "
@@ -3392,7 +3392,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": f"AI Evaluation Pipeline v{PIPELINE_VERSION}",
-        "architecture": "v6.3 Enterprise Production — 9-Agent LangGraph",
+        "architecture": "v6.2 Enterprise Production — 9-Agent LangGraph",
         "model": VL_MODEL_VERSION,
         "model_strategy": "unified_vl_only",
         "agents": [
