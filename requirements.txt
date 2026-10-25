@@ -1,5 +1,8 @@
 # PyTorch, HuggingFace & Fine-Tuning Core
+# torch + torchvision must come from the same CUDA index, e.g. for the Blackwell server:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 torch>=2.1.0
+torchvision>=0.16.0   # required by the Qwen2.5-VL processor — without it the model never loads
 transformers>=4.46.0
 peft>=0.13.0
 trl>=0.12.0
@@ -28,6 +31,9 @@ numpy>=1.24.0
 pandas>=2.0.0
 
 # Document Processing
+pymupdf>=1.23.0       # pipeline6 page images (import fitz)
+pillow>=10.0.0        # pipeline6 image loading
+httpx>=0.25.0         # pipeline6 OCR server client
 pypdf>=3.0.0
 python-docx>=0.8.11
 pdfplumber>=0.10.0
