@@ -1,5 +1,5 @@
 """
-pipeline6.py — AI Evaluation Pipeline v6.2 (Enterprise Production Standard)
+pipeline6.py — AI Evaluation Pipeline v6.3 (Enterprise Production Standard)
 
 Architecture Principle:
     Deterministic code handles all trusted structured exam data.
@@ -86,8 +86,8 @@ os.environ["KMP_BLOCKTIME"] = "1"
 torch.set_num_threads(OPTIMAL_TORCH_THREADS)
 
 # ── Pipeline Constants ──
-PIPELINE_VERSION = "6.2.0"
-PROMPT_VERSION = "v6.2"
+PIPELINE_VERSION = "6.3.0"
+PROMPT_VERSION = "v6.3"
 VL_MODEL_VERSION = "Qwen2.5-VL-3B-Instruct"
 OCR_SERVER_URL = os.getenv("OCR_SERVER_URL", "http://151.185.34.160:8000/ocrOutput")
 DEFAULT_MAX_MARKS = 5
