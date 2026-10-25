@@ -42,6 +42,7 @@ import math
 import time
 import logging
 import hashlib
+import difflib
 import html
 import unicodedata
 import threading
@@ -349,6 +350,7 @@ def _greedy_generate(model, inputs, max_new_tokens: int):
         temperature=None,
         top_p=None,
         top_k=None,
+        disable_compile=True,  # eager only — never JIT-compile (Triton needs gcc + Python.h on the server)
     )
 
 
@@ -394,8 +396,16 @@ def generate_with_vl(prompt: str, image_paths: Optional[List[str]] = None, max_n
         return output.strip()
 
     except Exception as e:
+        global _vl_first_error_logged
+        if not _vl_first_error_logged:
+            # Full stack once, so the library that triggered the failure (e.g. Triton) is visible.
+            _vl_first_error_logged = True
+            logger.error("[VL] First generation failure — full traceback:\n" + traceback.format_exc())
         logger.error(f"[VL] Generation error: {e}")
         raise RuntimeError(f"Qwen-VL inference failed: {str(e)}")
+
+
+_vl_first_error_logged = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2586,6 +2596,31 @@ def _extract_text_rubric(model_answer: str, max_marks: float) -> List[Dict[str, 
     return [{"id": "C1", "text": model_answer[:200], "marks": max_marks}]
 
 
+NEAR_VERBATIM_THRESHOLD = 0.92   # >= 92% character-level identical to the model answer → full marks
+NEAR_VERBATIM_MIN_CHARS = 20     # shorter answers are handled by the exact-match fast path
+
+# "Q.2.", "Ans.", "उत्तर 2:" etc. at the start of a line are OCR labels, not answer content.
+_ANSWER_LABEL_RE = re.compile(
+    r"^\s*(?:(?:Q|Que|Ques|Question|Ans|Answer|प्रश्न|प्र|उत्तर)\s*\.?\s*\d*(?:\.\d+)*\s*[.:)\-]?\s*)+",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _normalize_for_compare(text: str) -> str:
+    text = unicodedata.normalize("NFC", text or "")
+    text = _ANSWER_LABEL_RE.sub(" ", text)
+    text = re.sub(r"[^\w\s]", " ", text)  # punctuation incl. । and ॥ (Devanagari matras are \w-safe)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _answer_similarity(student: str, model: str) -> float:
+    """Character-level similarity (0-1) after removing labels, punctuation and spacing."""
+    a, b = _normalize_for_compare(student), _normalize_for_compare(model)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+
 def evaluate_text_answer(evidence: EvidencePacket) -> TextEvalResult:
     """Evaluate text answer using Qwen2.5-VL-3B with non-destructive security."""
     result = TextEvalResult(max_marks=evidence.rubric.text_marks)
@@ -2652,6 +2687,25 @@ def evaluate_text_answer(evidence: EvidencePacket) -> TextEvalResult:
                 result.parse_confidence = 1.0
                 logger.info(f"[Fast-Path] {evidence.question_id} Exact Substring Match ('{clean_model_strip}'): score={result.score}/{evidence.rubric.text_marks}")
                 return result
+
+    # Near-verbatim fast path: the student reproduced the model answer almost word
+    # for word (only OCR noise, "Q.2."/"Ans." labels, a typo or missing danda differ).
+    # Deterministic full marks — no model call, so it can never be lost to a model error.
+    if not evidence.rubric.has_diagram and len(clean_model_strip) >= NEAR_VERBATIM_MIN_CHARS:
+        similarity = _answer_similarity(student_ans, model_ans)
+        if similarity >= NEAR_VERBATIM_THRESHOLD:
+            result.score = evidence.rubric.text_marks
+            result.reasoning = f"Answer matches the reference answer almost word for word ({similarity:.0%} identical)."
+            result.feedback = "Your answer is correct and complete. Well done!"
+            result.strengths = ["Complete answer matching the reference."]
+            result.parse_confidence = 1.0
+            student_kws, model_kws = extract_concepts(student_ans), extract_concepts(model_ans)
+            result.keywords_matched = list(student_kws & model_kws)
+            result.keywords_missing = list(model_kws - student_kws)[:5]
+            result.concept_coverage_pct = calculate_concept_coverage(student_ans, model_ans)
+            logger.info(f"[Fast-Path] {evidence.question_id} Near-verbatim match ({similarity:.1%}): "
+                        f"score={result.score}/{evidence.rubric.text_marks}")
+            return result
 
     # Build rubric
     rubric = _extract_text_rubric(model_ans, evidence.rubric.text_marks)
@@ -3589,7 +3643,20 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Pipeline v6.2 starting — Pre-loading Qwen2.5-VL-3B-Instruct...")
     try:
         get_vl_model()
-        logger.info("✅ Unified VL model loaded! Server ready.")
+        logger.info("✅ Unified VL model loaded!")
+        # Self-test: loading is not enough — the server once loaded fine but EVERY
+        # generate() crashed (Triton could not build: Python.h missing), and all
+        # answers silently got 0. Generate a few tokens now so that shows at boot.
+        try:
+            reply = generate_with_vl("Reply with the single word OK.", max_new_tokens=5)
+            logger.info(f"✅ Generation self-test passed (model replied: {reply!r}). Server ready.")
+        except Exception as gen_err:
+            logger.error("\n" + "=" * 100
+                         + "\n MODEL LOADED BUT CANNOT GENERATE — every answer would be scored 0 / Needs Review"
+                         + f"\n ERROR : {str(gen_err)[:500]}"
+                         + "\n FIX   : if the error mentions gcc / Python.h / triton, run on the server:"
+                         + "\n         sudo apt-get install -y python3.12-dev build-essential && rm -rf ~/.triton/cache"
+                         + "\n" + "=" * 100)
     except Exception as e:
         # Without the model every evaluation fails, so make this impossible to miss.
         logger.error("Full model-load traceback:\n" + traceback.format_exc())
