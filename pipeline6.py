@@ -3521,9 +3521,13 @@ def run_pipeline6(
     """Main orchestrator for v6.2 pipeline."""
     pipeline_start = time.time()
     session_id = hashlib.md5(f"{student_id}{exam_id}{pipeline_start}".encode()).hexdigest()[:12]
+    # Load (or reuse) the model FIRST. If it cannot load, fail loudly with the real
+    # error — never return marks built from failed model calls (all zeros/fallbacks).
+    get_vl_model()
     issues: List[str] = []
     issues_token = _request_issues.set(issues)
-    if IS_CUDA:
+    if IS_CUDA and torch.cuda.is_initialized():
+        # reset_peak_memory_stats raises "Invalid device argument" before CUDA init.
         torch.cuda.reset_peak_memory_stats(0)
 
     initial_state: PipelineGraphState = {
@@ -3572,7 +3576,13 @@ async def lifespan(app: FastAPI):
         get_vl_model()
         logger.info("✅ Unified VL model loaded! Server ready.")
     except Exception as e:
-        logger.warning(f"⚠️ Model pre-load failed (will lazy-load on demand): {e}")
+        # Without the model every evaluation fails, so make this impossible to miss.
+        logger.error("Full model-load traceback:\n" + traceback.format_exc())
+        logger.error("\n" + "=" * 100
+                     + "\n MODEL FAILED TO LOAD — evaluations will return HTTP 500 until this is fixed"
+                     + f"\n ERROR : {type(e).__name__}: {str(e)[:500]}"
+                     + f"\n MODEL : {VL_MODEL_PATH}"
+                     + "\n" + "=" * 100)
     TEMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     yield
     logger.info("👋 Pipeline v6.2 shutting down.")
