@@ -49,6 +49,7 @@ import functools
 import contextvars
 import importlib.util
 import tempfile
+import traceback
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Any, List, Dict, Tuple, Set
@@ -63,8 +64,9 @@ from langgraph.graph import StateGraph, START, END
 import httpx
 import torch
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Fix Windows console encoding
@@ -3593,6 +3595,33 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def report_unhandled_errors(request: Request, call_next):
+    """Turn any crash into a short error box printed LAST on screen + a JSON 500.
+
+    Uvicorn's default traceback is long and the real error line is at the very
+    bottom; this prints the full traceback first and then a 4-line summary.
+    """
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        frames = traceback.extract_tb(exc.__traceback__)
+        ours = [f for f in frames if f.filename.endswith("pipeline6.py")]
+        ours_at = f"pipeline6.py:{ours[-1].lineno} in {ours[-1].name}()" if ours else "not in pipeline6.py"
+        raised_at = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno} in {frames[-1].name}()" if frames else "unknown"
+        error = f"{type(exc).__name__}: {exc}"
+        logger.error("Full traceback:\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        logger.error("\n" + "=" * 100
+                     + f"\n REQUEST FAILED : {request.method} {request.url.path}"
+                     + f"\n ERROR          : {error[:500]}"
+                     + f"\n OUR CODE LINE  : {ours_at}"
+                     + f"\n RAISED IN      : {raised_at}"
+                     + "\n" + "=" * 100)
+        return JSONResponse(status_code=500, content={
+            "status": "error", "error": error[:1000], "where": ours_at, "raised_in": raised_at,
+        })
 
 
 @app.get("/health")
